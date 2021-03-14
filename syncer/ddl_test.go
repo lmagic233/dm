@@ -387,6 +387,11 @@ func (s *testSyncerSuite) TestResolveOnlineDDL(c *C) {
 			"_t1_old",
 			"_t1_new",
 		},
+		{
+			config.ALIRDS,
+			"tp_284736_del_t1",
+			"tp_284736_ogt_t1",
+		},
 	}
 	tctx := tcontext.Background()
 	p := parser.New()

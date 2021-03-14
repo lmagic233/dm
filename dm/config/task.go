@@ -38,8 +38,9 @@ import (
 
 // Online DDL Scheme
 const (
-	GHOST = "gh-ost"
-	PT    = "pt"
+	GHOST  = "gh-ost"
+	PT     = "pt"
+	ALIRDS = "ali-rds"
 )
 
 // shard DDL mode.
@@ -406,7 +407,7 @@ func (c *TaskConfig) adjust() error {
 		}
 	}
 
-	if c.OnlineDDLScheme != "" && c.OnlineDDLScheme != PT && c.OnlineDDLScheme != GHOST {
+	if c.OnlineDDLScheme != "" && c.OnlineDDLScheme != PT && c.OnlineDDLScheme != GHOST && c.OnlineDDLScheme != ALIRDS {
 		return terror.ErrConfigOnlineSchemeNotSupport.Generate(c.OnlineDDLScheme)
 	}
 
