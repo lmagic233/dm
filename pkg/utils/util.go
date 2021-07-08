@@ -15,24 +15,23 @@ package utils
 
 import (
 	"context"
-	"math"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
 	gmysql "github.com/go-sql-driver/mysql"
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/errno"
-	"github.com/siddontang/go-mysql/mysql"
 
 	"github.com/pingcap/dm/dm/pb"
 	"github.com/pingcap/dm/pkg/terror"
 )
 
 var (
-	// OsExit is function placeholder for os.Exit
+	// OsExit is function placeholder for os.Exit.
 	OsExit func(int)
 	/*
 		CREATE [TEMPORARY] TABLE [IF NOT EXISTS] tbl_name
@@ -107,7 +106,7 @@ func init() {
 	pb.HidePwdFunc = HidePassword
 }
 
-// DecodeBinlogPosition parses a mysql.Position from string format
+// DecodeBinlogPosition parses a mysql.Position from string format.
 func DecodeBinlogPosition(pos string) (*mysql.Position, error) {
 	if len(pos) < 3 {
 		return nil, terror.ErrInvalidBinlogPosStr.Generate(pos)
@@ -129,28 +128,6 @@ func DecodeBinlogPosition(pos string) (*mysql.Position, error) {
 	}, nil
 }
 
-// CompareBinlogPos compares binlog positions.
-// The result will be 0 if |a-b| < deviation, otherwise -1 if a < b, and +1 if a > b.
-func CompareBinlogPos(a, b mysql.Position, deviation float64) int {
-	if a.Name < b.Name {
-		return -1
-	}
-
-	if a.Name > b.Name {
-		return 1
-	}
-
-	if math.Abs(float64(a.Pos)-float64(b.Pos)) <= deviation {
-		return 0
-	}
-
-	if a.Pos < b.Pos {
-		return -1
-	}
-
-	return 1
-}
-
 // WaitSomething waits for something done with `true`.
 func WaitSomething(backoff int, waitTime time.Duration, fn func() bool) bool {
 	for i := 0; i < backoff; i++ {
@@ -164,12 +141,12 @@ func WaitSomething(backoff int, waitTime time.Duration, fn func() bool) bool {
 	return false
 }
 
-// IsContextCanceledError checks whether err is context.Canceled
+// IsContextCanceledError checks whether err is context.Canceled.
 func IsContextCanceledError(err error) bool {
 	return errors.Cause(err) == context.Canceled
 }
 
-// IgnoreErrorCheckpoint is used in checkpoint update
+// IgnoreErrorCheckpoint is used in checkpoint update.
 func IgnoreErrorCheckpoint(err error) bool {
 	err = errors.Cause(err) // check the original error
 	mysqlErr, ok := err.(*gmysql.MySQLError)
@@ -185,18 +162,18 @@ func IgnoreErrorCheckpoint(err error) bool {
 	}
 }
 
-// IsBuildInSkipDDL return true when checked sql that will be skipped for syncer
+// IsBuildInSkipDDL return true when checked sql that will be skipped for syncer.
 func IsBuildInSkipDDL(sql string) bool {
 	return builtInSkipDDLPatterns.FindStringIndex(sql) != nil
 }
 
-// HidePassword replace password with ******
+// HidePassword replace password with ******.
 func HidePassword(input string) string {
 	output := passwordRegexp.ReplaceAllString(input, "$1******$4")
 	return output
 }
 
-// UnwrapScheme removes http or https scheme from input
+// UnwrapScheme removes http or https scheme from input.
 func UnwrapScheme(s string) string {
 	if strings.HasPrefix(s, "http://") {
 		return s[len("http://"):]
@@ -227,7 +204,7 @@ func WrapSchemes(s string, https bool) string {
 	return strings.Join(output, ",")
 }
 
-// WrapSchemesForInitialCluster acts like WrapSchemes, except input is "name=URL,..."
+// WrapSchemesForInitialCluster acts like WrapSchemes, except input is "name=URL,...".
 func WrapSchemesForInitialCluster(s string, https bool) string {
 	items := strings.Split(s, ",")
 	output := make([]string, 0, len(items))

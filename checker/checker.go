@@ -39,7 +39,7 @@ import (
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	router "github.com/pingcap/tidb-tools/pkg/table-router"
-	"github.com/siddontang/go/sync2"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 )
 
@@ -61,9 +61,9 @@ type mysqlInstance struct {
 	targetDBInfo *dbutil.DBConfig
 }
 
-// Checker performs pre-check of data synchronization
+// Checker performs pre-check of data synchronization.
 type Checker struct {
-	closed sync2.AtomicBool
+	closed atomic.Bool
 
 	logger log.Logger
 
@@ -75,18 +75,22 @@ type Checker struct {
 		sync.RWMutex
 		detail *check.Results
 	}
+	errCnt  int64
+	warnCnt int64
 }
 
-// NewChecker returns a checker
-func NewChecker(cfgs []*config.SubTaskConfig, checkingItems map[string]string) *Checker {
+// NewChecker returns a checker.
+func NewChecker(cfgs []*config.SubTaskConfig, checkingItems map[string]string, errCnt, warnCnt int64) *Checker {
 	c := &Checker{
 		instances:     make([]*mysqlInstance, 0, len(cfgs)),
 		checkingItems: checkingItems,
 		logger:        log.With(zap.String("unit", "task check")),
+		errCnt:        errCnt,
+		warnCnt:       warnCnt,
 	}
 
 	for _, cfg := range cfgs {
-		// we have verify it in subtask config
+		// we have verify it in SubTaskConfig.Adjust
 		replica, _ := cfg.DecryptPassword()
 		c.instances = append(c.instances, &mysqlInstance{
 			cfg: replica,
@@ -96,7 +100,7 @@ func NewChecker(cfgs []*config.SubTaskConfig, checkingItems map[string]string) *
 	return c
 }
 
-// Init implements Unit interface
+// Init implements Unit interface.
 func (c *Checker) Init(ctx context.Context) (err error) {
 	rollbackHolder := fr.NewRollbackHolder("checker")
 	defer func() {
@@ -224,7 +228,7 @@ func (c *Checker) Init(ctx context.Context) (err error) {
 				continue
 			}
 
-			c.checkList = append(c.checkList, check.NewShardingTablesCheck(name, dbs, shardingSet, columnMapping, checkingShardID))
+			c.checkList = append(c.checkList, check.NewShardingTablesChecker(name, dbs, shardingSet, columnMapping, checkingShardID))
 		}
 	}
 
@@ -246,7 +250,7 @@ func (c *Checker) displayCheckingItems() string {
 	return buf.String()
 }
 
-// Process implements Unit interface
+// Process implements Unit interface.
 func (c *Checker) Process(ctx context.Context, pr chan pb.ProcessResult) {
 	cctx, cancel := context.WithTimeout(ctx, checkTimeout)
 	defer cancel()
@@ -258,11 +262,54 @@ func (c *Checker) Process(ctx context.Context, pr chan pb.ProcessResult) {
 		errs = append(errs, unit.NewProcessError(err))
 	} else if !result.Summary.Passed {
 		errs = append(errs, unit.NewProcessError(errors.New("check was failed, please see detail")))
+		warnLeft, errLeft := c.warnCnt, c.errCnt
 
 		// remove success result if not pass
 		results := result.Results[:0]
 		for _, r := range result.Results {
-			if r.State != check.StateSuccess {
+			if r.State == check.StateSuccess {
+				continue
+			}
+
+			// handle results without r.Errors
+			if len(r.Errors) == 0 {
+				switch r.State {
+				case check.StateWarning:
+					if warnLeft == 0 {
+						continue
+					}
+					warnLeft--
+					results = append(results, r)
+				case check.StateFailure:
+					if errLeft == 0 {
+						continue
+					}
+					errLeft--
+					results = append(results, r)
+				}
+				continue
+			}
+
+			subErrors := make([]*check.Error, 0, len(r.Errors))
+			for _, e := range r.Errors {
+				switch e.Severity {
+				case check.StateWarning:
+					if warnLeft == 0 {
+						continue
+					}
+					warnLeft--
+					subErrors = append(subErrors, e)
+				case check.StateFailure:
+					if errLeft == 0 {
+						continue
+					}
+					errLeft--
+					subErrors = append(subErrors, e)
+				}
+			}
+			// skip display an empty Result
+			if len(subErrors) > 0 {
+				r.Errors = subErrors
 				results = append(results, r)
 			}
 		}
@@ -293,7 +340,7 @@ func (c *Checker) Process(ctx context.Context, pr chan pb.ProcessResult) {
 	}
 }
 
-// updateInstruction updates the check result's Instruction
+// updateInstruction updates the check result's Instruction.
 func (c *Checker) updateInstruction(result *check.Results) {
 	for _, r := range result.Results {
 		if r.State == check.StateSuccess {
@@ -301,8 +348,7 @@ func (c *Checker) updateInstruction(result *check.Results) {
 		}
 
 		// can't judge by other field, maybe update it later
-		switch r.Extra {
-		case check.AutoIncrementKeyChecking:
+		if r.Extra == check.AutoIncrementKeyChecking {
 			if strings.HasPrefix(r.Instruction, "please handle it by yourself") {
 				r.Instruction += ",  refer to https://docs.pingcap.com/tidb-data-migration/stable/shard-merge-best-practices#handle-conflicts-of-auto-increment-primary-key) for details."
 			}
@@ -310,15 +356,15 @@ func (c *Checker) updateInstruction(result *check.Results) {
 	}
 }
 
-// Close implements Unit interface
+// Close implements Unit interface.
 func (c *Checker) Close() {
-	if c.closed.Get() {
+	if c.closed.Load() {
 		return
 	}
 
 	c.closeDBs()
 
-	c.closed.Set(true)
+	c.closed.Store(true)
 }
 
 func (c *Checker) closeDBs() {
@@ -339,17 +385,17 @@ func (c *Checker) closeDBs() {
 	}
 }
 
-// Pause implements Unit interface
+// Pause implements Unit interface.
 func (c *Checker) Pause() {
-	if c.closed.Get() {
+	if c.closed.Load() {
 		c.logger.Warn("try to pause, but already closed")
 		return
 	}
 }
 
-// Resume resumes the paused process
+// Resume resumes the paused process.
 func (c *Checker) Resume(ctx context.Context, pr chan pb.ProcessResult) {
-	if c.closed.Get() {
+	if c.closed.Load() {
 		c.logger.Warn("try to resume, but already closed")
 		return
 	}
@@ -357,23 +403,23 @@ func (c *Checker) Resume(ctx context.Context, pr chan pb.ProcessResult) {
 	c.Process(ctx, pr)
 }
 
-// Update implements Unit.Update
+// Update implements Unit.Update.
 func (c *Checker) Update(cfg *config.SubTaskConfig) error {
 	// not support update configuration now
 	return nil
 }
 
-// Type implements Unit interface
+// Type implements Unit interface.
 func (c *Checker) Type() pb.UnitType {
 	return pb.UnitType_Check
 }
 
-// IsFreshTask implements Unit.IsFreshTask
+// IsFreshTask implements Unit.IsFreshTask.
 func (c *Checker) IsFreshTask() (bool, error) {
 	return true, nil
 }
 
-// Status implements Unit interface
+// Status implements Unit interface.
 func (c *Checker) Status() interface{} {
 	c.result.RLock()
 	res := c.result.detail
@@ -394,7 +440,7 @@ func (c *Checker) Status() interface{} {
 	}
 }
 
-// Error implements Unit interface
+// Error implements Unit interface.
 func (c *Checker) Error() interface{} {
 	return &pb.CheckError{}
 }

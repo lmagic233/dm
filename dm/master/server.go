@@ -23,16 +23,15 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	toolutils "github.com/pingcap/tidb-tools/pkg/utils"
-	"github.com/siddontang/go/sync2"
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/embed"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
@@ -45,7 +44,6 @@ import (
 	"github.com/pingcap/dm/dm/master/workerrpc"
 	"github.com/pingcap/dm/dm/pb"
 	"github.com/pingcap/dm/dm/unit"
-	"github.com/pingcap/dm/pkg/atomic2"
 	"github.com/pingcap/dm/pkg/conn"
 	tcontext "github.com/pingcap/dm/pkg/context"
 	"github.com/pingcap/dm/pkg/cputil"
@@ -64,27 +62,25 @@ const (
 	// DM-master cluster : etcd cluster = 1 : 1 now.
 	electionKey = "/dm-master/leader"
 
-	// getLeaderBlockTime is the max block time for get leader information from election
+	// getLeaderBlockTime is the max block time for get leader information from election.
 	getLeaderBlockTime = 10 * time.Minute
 )
 
 var (
-	// the retry times for dm-master to confirm the dm-workers status is expected
+	// the retry times for dm-master to confirm the dm-workers status is expected.
 	maxRetryNum = 30
-	// the retry interval for dm-master to confirm the dm-workers status is expected
+	// the retry interval for dm-master to confirm the dm-workers status is expected.
 	retryInterval = time.Second
 
-	// 0 means not use tls
-	// 1 means use tls
-	useTLS = int32(0)
+	useTLS atomic.Bool
 
 	// typically there's only one server running in one process, but testMaster.TestOfflineMember starts 3 servers,
-	// so we need sync.Once to prevent data race
+	// so we need sync.Once to prevent data race.
 	registerOnce      sync.Once
 	runBackgroundOnce sync.Once
 )
 
-// Server handles RPC requests for dm-master
+// Server handles RPC requests for dm-master.
 type Server struct {
 	sync.RWMutex
 
@@ -98,15 +94,12 @@ type Server struct {
 
 	// below three leader related variables should be protected by a lock (currently Server's lock) to provide integrity
 	// except for leader == oneselfStartingLeader which is a intermedia state, which means caller may retry sometime later
-	leader         atomic2.AtomicString
+	leader         atomic.String
 	leaderClient   pb.MasterClient
 	leaderGrpcConn *grpc.ClientConn
 
 	// removeMetaLock locks start task when removing meta
 	removeMetaLock sync.RWMutex
-
-	// WaitGroup for background functions.
-	bgFunWg sync.WaitGroup
 
 	// dm-worker-ID(host:ip) -> dm-worker client management
 	scheduler *scheduler.Scheduler
@@ -119,10 +112,13 @@ type Server struct {
 	// agent pool
 	ap *AgentPool
 
-	closed sync2.AtomicBool
+	// WaitGroup for background functions.
+	bgFunWg sync.WaitGroup
+
+	closed atomic.Bool
 }
 
-// NewServer creates a new Server
+// NewServer creates a new Server.
 func NewServer(cfg *Config) *Server {
 	logger := log.L()
 	server := Server{
@@ -132,14 +128,14 @@ func NewServer(cfg *Config) *Server {
 	}
 	server.pessimist = shardddl.NewPessimist(&logger, server.getTaskResources)
 	server.optimist = shardddl.NewOptimist(&logger)
-	server.closed.Set(true)
+	server.closed.Store(true)
 
 	setUseTLS(&cfg.Security)
 
 	return &server
 }
 
-// Start starts to serving
+// Start starts to serving.
 func (s *Server) Start(ctx context.Context) (err error) {
 	etcdCfg := genEmbedEtcdConfigWithLogger(s.cfg.LogLevel)
 	// prepare config to join an existing cluster
@@ -215,7 +211,7 @@ func (s *Server) Start(ctx context.Context) (err error) {
 		return
 	}
 
-	s.closed.Set(false) // the server started now.
+	s.closed.Store(false) // the server started now.
 
 	s.bgFunWg.Add(1)
 	go func() {
@@ -246,12 +242,12 @@ func (s *Server) Start(ctx context.Context) (err error) {
 	})
 
 	log.L().Info("listening gRPC API and status request", zap.String("address", s.cfg.MasterAddr))
-	return
+	return nil
 }
 
-// Close close the RPC server, this function can be called multiple times
+// Close close the RPC server, this function can be called multiple times.
 func (s *Server) Close() {
-	if s.closed.Get() {
+	if s.closed.Load() {
 		return
 	}
 	log.L().Info("closing server")
@@ -277,7 +273,7 @@ func (s *Server) Close() {
 	if s.etcd != nil {
 		s.etcd.Close()
 	}
-	s.closed.Set(true)
+	s.closed.Store(true)
 }
 
 func errorCommonWorkerResponse(msg string, source, worker string) *pb.CommonWorkerResponse {
@@ -304,6 +300,7 @@ func (s *Server) RegisterWorker(ctx context.Context, req *pb.RegisterWorkerReque
 
 	err := s.scheduler.AddWorker(req.Name, req.Address)
 	if err != nil {
+		// nolint:nilerr
 		return &pb.RegisterWorkerResponse{
 			Result: false,
 			Msg:    err.Error(),
@@ -330,23 +327,26 @@ func (s *Server) OfflineMember(ctx context.Context, req *pb.OfflineMemberRequest
 		return resp2, err2
 	}
 
-	if req.Type == common.Worker {
+	switch req.Type {
+	case common.Worker:
 		err := s.scheduler.RemoveWorker(req.Name)
 		if err != nil {
+			// nolint:nilerr
 			return &pb.OfflineMemberResponse{
 				Result: false,
 				Msg:    err.Error(),
 			}, nil
 		}
-	} else if req.Type == common.Master {
+	case common.Master:
 		err := s.deleteMasterByName(ctx, req.Name)
 		if err != nil {
+			// nolint:nilerr
 			return &pb.OfflineMemberResponse{
 				Result: false,
 				Msg:    err.Error(),
 			}, nil
 		}
-	} else {
+	default:
 		return &pb.OfflineMemberResponse{
 			Result: false,
 			Msg:    terror.ErrMasterInvalidOfflineType.Generate(req.Type).Error(),
@@ -393,21 +393,33 @@ func subtaskCfgPointersToInstances(stCfgPointers ...*config.SubTaskConfig) []con
 	return stCfgs
 }
 
-// StartTask implements MasterServer.StartTask
+// StartTask implements MasterServer.StartTask.
 func (s *Server) StartTask(ctx context.Context, req *pb.StartTaskRequest) (*pb.StartTaskResponse, error) {
 	var (
 		resp2 *pb.StartTaskResponse
 		err2  error
 	)
+	failpoint.Inject("LongRPCResponse", func() {
+		var b strings.Builder
+		size := 5 * 1024 * 1024
+		b.Grow(size)
+		for i := 0; i < size; i++ {
+			b.WriteByte(0)
+		}
+		resp2 = &pb.StartTaskResponse{Msg: b.String()}
+		failpoint.Return(resp2, nil)
+	})
+
 	shouldRet := s.sharedLogic(ctx, req, &resp2, &err2)
 	if shouldRet {
 		return resp2, err2
 	}
 
 	resp := &pb.StartTaskResponse{}
-	cfg, stCfgs, err := s.generateSubTask(ctx, req.Task)
+	cfg, stCfgs, err := s.generateSubTask(ctx, req.Task, common.DefaultErrorCnt, common.DefaultWarnCnt)
 	if err != nil {
 		resp.Msg = err.Error()
+		// nolint:nilerr
 		return resp, nil
 	}
 	log.L().Info("", zap.String("task name", cfg.Name), zap.String("task", cfg.JSON()), zap.String("request", "StartTask"))
@@ -457,6 +469,7 @@ func (s *Server) StartTask(ctx context.Context, req *pb.StartTaskRequest) (*pb.S
 		s.removeMetaLock.Unlock()
 		if err != nil {
 			resp.Msg = err.Error()
+			// nolint:nilerr
 			return resp, nil
 		}
 
@@ -471,7 +484,7 @@ func (s *Server) StartTask(ctx context.Context, req *pb.StartTaskRequest) (*pb.S
 	return resp, nil
 }
 
-// OperateTask implements MasterServer.OperateTask
+// OperateTask implements MasterServer.OperateTask.
 func (s *Server) OperateTask(ctx context.Context, req *pb.OperateTaskRequest) (*pb.OperateTaskResponse, error) {
 	var (
 		resp2 *pb.OperateTaskResponse
@@ -515,6 +528,7 @@ func (s *Server) OperateTask(ctx context.Context, req *pb.OperateTaskRequest) (*
 	}
 	if err != nil {
 		resp.Msg = err.Error()
+		// nolint:nilerr
 		return resp, nil
 	}
 
@@ -523,7 +537,7 @@ func (s *Server) OperateTask(ctx context.Context, req *pb.OperateTaskRequest) (*
 	return resp, nil
 }
 
-// GetSubTaskCfg implements MasterServer.GetSubTaskCfg
+// GetSubTaskCfg implements MasterServer.GetSubTaskCfg.
 func (s *Server) GetSubTaskCfg(ctx context.Context, req *pb.GetSubTaskCfgRequest) (*pb.GetSubTaskCfgResponse, error) {
 	var (
 		resp2 *pb.GetSubTaskCfgResponse
@@ -547,12 +561,13 @@ func (s *Server) GetSubTaskCfg(ctx context.Context, req *pb.GetSubTaskCfgRequest
 	for _, cfg := range subCfgs {
 		cfgBytes, err := cfg.Toml()
 		if err != nil {
+			// nolint:nilerr
 			return &pb.GetSubTaskCfgResponse{
 				Result: false,
 				Msg:    err.Error(),
 			}, nil
 		}
-		cfgs = append(cfgs, string(cfgBytes))
+		cfgs = append(cfgs, cfgBytes)
 	}
 
 	return &pb.GetSubTaskCfgResponse{
@@ -562,7 +577,7 @@ func (s *Server) GetSubTaskCfg(ctx context.Context, req *pb.GetSubTaskCfgRequest
 }
 
 // UpdateTask implements MasterServer.UpdateTask
-// TODO: support update task later
+// TODO: support update task later.
 func (s *Server) UpdateTask(ctx context.Context, req *pb.UpdateTaskRequest) (*pb.UpdateTaskResponse, error) {
 	var (
 		resp2 *pb.UpdateTaskResponse
@@ -573,8 +588,9 @@ func (s *Server) UpdateTask(ctx context.Context, req *pb.UpdateTaskRequest) (*pb
 		return resp2, err2
 	}
 
-	cfg, stCfgs, err := s.generateSubTask(ctx, req.Task)
+	cfg, stCfgs, err := s.generateSubTask(ctx, req.Task, common.DefaultErrorCnt, common.DefaultWarnCnt)
 	if err != nil {
+		// nolint:nilerr
 		return &pb.UpdateTaskResponse{
 			Result: false,
 			Msg:    err.Error(),
@@ -632,26 +648,25 @@ type hasWokers interface {
 func extractSources(s *Server, req hasWokers) ([]string, error) {
 	var sources []string
 
-	if len(req.GetSources()) > 0 {
-		// query specified dm-workers
-		invalidWorkers := make([]string, 0, len(req.GetSources()))
-		for _, source := range req.GetSources() {
-			w := s.scheduler.GetWorkerBySource(source)
-			if w == nil || w.Stage() == scheduler.WorkerOffline {
-				invalidWorkers = append(invalidWorkers, source)
+	switch {
+	case len(req.GetSources()) > 0:
+		sources = req.GetSources()
+		var invalidSource []string
+		for _, source := range sources {
+			if s.scheduler.GetSourceCfgByID(source) == nil {
+				invalidSource = append(invalidSource, source)
 			}
 		}
-		if len(invalidWorkers) > 0 {
-			return nil, errors.Errorf("%s relevant worker-client not found", strings.Join(invalidWorkers, ", "))
+		if len(invalidSource) > 0 {
+			return nil, errors.Errorf("sources %s haven't been added", invalidSource)
 		}
-		sources = req.GetSources()
-	} else if len(req.GetName()) > 0 {
+	case len(req.GetName()) > 0:
 		// query specified task's sources
 		sources = s.getTaskResources(req.GetName())
 		if len(sources) == 0 {
 			return nil, errors.Errorf("task %s has no source or not exist", req.GetName())
 		}
-	} else {
+	default:
 		// query all sources
 		log.L().Info("get sources")
 		sources = s.scheduler.BoundSources()
@@ -659,7 +674,7 @@ func extractSources(s *Server, req hasWokers) ([]string, error) {
 	return sources, nil
 }
 
-// QueryStatus implements MasterServer.QueryStatus
+// QueryStatus implements MasterServer.QueryStatus.
 func (s *Server) QueryStatus(ctx context.Context, req *pb.QueryStatusListRequest) (*pb.QueryStatusListResponse, error) {
 	var (
 		resp2 *pb.QueryStatusListResponse
@@ -672,23 +687,32 @@ func (s *Server) QueryStatus(ctx context.Context, req *pb.QueryStatusListRequest
 
 	sources, err := extractSources(s, req)
 	if err != nil {
+		// nolint:nilerr
 		return &pb.QueryStatusListResponse{
 			Result: false,
 			Msg:    err.Error(),
 		}, nil
 	}
-	workerRespCh := s.getStatusFromWorkers(ctx, sources, req.Name)
 
-	workerRespMap := make(map[string]*pb.QueryStatusResponse, len(sources))
-	for len(workerRespCh) > 0 {
-		workerResp := <-workerRespCh
-		workerRespMap[workerResp.SourceStatus.Source] = workerResp
+	queryRelayWorker := false
+	if len(req.GetSources()) > 0 {
+		// if user specified sources, query relay workers instead of task workers
+		queryRelayWorker = true
+	}
+
+	resps := s.getStatusFromWorkers(ctx, sources, req.Name, queryRelayWorker)
+
+	s.fillUnsyncedStatus(resps)
+
+	workerRespMap := make(map[string][]*pb.QueryStatusResponse, len(sources))
+	for _, workerResp := range resps {
+		workerRespMap[workerResp.SourceStatus.Source] = append(workerRespMap[workerResp.SourceStatus.Source], workerResp)
 	}
 
 	sort.Strings(sources)
 	workerResps := make([]*pb.QueryStatusResponse, 0, len(sources))
 	for _, worker := range sources {
-		workerResps = append(workerResps, workerRespMap[worker])
+		workerResps = append(workerResps, workerRespMap[worker]...)
 	}
 	resp := &pb.QueryStatusListResponse{
 		Result:  true,
@@ -697,7 +721,33 @@ func (s *Server) QueryStatus(ctx context.Context, req *pb.QueryStatusListRequest
 	return resp, nil
 }
 
-// ShowDDLLocks implements MasterServer.ShowDDLLocks
+// adjust unsynced field in sync status by looking at DDL locks.
+// because if a DM-worker doesn't receive any shard DDL, it doesn't even know it's unsynced for itself.
+func (s *Server) fillUnsyncedStatus(resps []*pb.QueryStatusResponse) {
+	for _, resp := range resps {
+		for _, subtaskStatus := range resp.SubTaskStatus {
+			syncStatus := subtaskStatus.GetSync()
+			if syncStatus == nil || len(syncStatus.UnresolvedGroups) != 0 {
+				continue
+			}
+			// TODO: look at s.optimist when `query-status` support show `UnresolvedGroups` in optimistic mode.
+			locks := s.pessimist.ShowLocks(subtaskStatus.Name, []string{resp.SourceStatus.Source})
+			if len(locks) == 0 {
+				continue
+			}
+
+			for _, l := range locks {
+				db, table := utils.ExtractDBAndTableFromLockID(l.ID)
+				syncStatus.UnresolvedGroups = append(syncStatus.UnresolvedGroups, &pb.ShardingGroup{
+					Target:   dbutil.TableName(db, table),
+					Unsynced: []string{"this DM-worker doesn't receive any shard DDL of this group"},
+				})
+			}
+		}
+	}
+}
+
+// ShowDDLLocks implements MasterServer.ShowDDLLocks.
 func (s *Server) ShowDDLLocks(ctx context.Context, req *pb.ShowDDLLocksRequest) (*pb.ShowDDLLocksResponse, error) {
 	var (
 		resp2 *pb.ShowDDLLocksResponse
@@ -743,17 +793,18 @@ func (s *Server) UnlockDDLLock(ctx context.Context, req *pb.UnlockDDLLockRequest
 		return resp, nil
 	}
 	subtasks := s.scheduler.GetSubTaskCfgsByTask(task)
-	if len(subtasks) == 0 {
-		resp.Msg = "task (" + task + ") which extracted from lock-ID is not found in DM"
-		return resp, nil
-	}
-
-	for _, subtask := range subtasks {
-		if subtask.ShardMode != config.ShardPessimistic {
-			resp.Msg = "`unlock-ddl-lock` is only supported in pessimistic shard mode currently"
-			return resp, nil
+	if len(subtasks) > 0 {
+		// subtasks should have same ShardMode
+		for _, subtask := range subtasks {
+			if subtask.ShardMode == config.ShardOptimistic {
+				resp.Msg = "`unlock-ddl-lock` is only supported in pessimistic shard mode currently"
+				return resp, nil
+			}
+			break
 		}
-		break
+	} else {
+		// task is deleted so worker is not watching etcd, automatically set --force-remove
+		req.ForceRemove = true
 	}
 
 	// TODO: add `unlock-ddl-lock` support for Optimist later.
@@ -767,7 +818,7 @@ func (s *Server) UnlockDDLLock(ctx context.Context, req *pb.UnlockDDLLockRequest
 	return resp, nil
 }
 
-// PurgeWorkerRelay implements MasterServer.PurgeWorkerRelay
+// PurgeWorkerRelay implements MasterServer.PurgeWorkerRelay.
 func (s *Server) PurgeWorkerRelay(ctx context.Context, req *pb.PurgeWorkerRelayRequest) (*pb.PurgeWorkerRelayResponse, error) {
 	var (
 		resp2 *pb.PurgeWorkerRelayResponse
@@ -788,49 +839,66 @@ func (s *Server) PurgeWorkerRelay(ctx context.Context, req *pb.PurgeWorkerRelayR
 		},
 	}
 
-	workerRespCh := make(chan *pb.CommonWorkerResponse, len(req.Sources))
+	var (
+		workerResps  = make([]*pb.CommonWorkerResponse, 0, len(req.Sources))
+		workerRespMu sync.Mutex
+	)
+	setWorkerResp := func(resp *pb.CommonWorkerResponse) {
+		workerRespMu.Lock()
+		workerResps = append(workerResps, resp)
+		workerRespMu.Unlock()
+	}
+
 	var wg sync.WaitGroup
 	for _, source := range req.Sources {
-		wg.Add(1)
-		go func(source string) {
-			defer wg.Done()
-			worker := s.scheduler.GetWorkerBySource(source)
+		workers, err := s.scheduler.GetRelayWorkers(source)
+		if err != nil {
+			return nil, err
+		}
+		if len(workers) == 0 {
+			setWorkerResp(errorCommonWorkerResponse(fmt.Sprintf("relay worker for source %s not found, please `start-relay` first", source), source, ""))
+			continue
+		}
+		for _, worker := range workers {
 			if worker == nil {
-				workerRespCh <- errorCommonWorkerResponse(fmt.Sprintf("source %s relevant worker-client not found", source), source, "")
-				return
+				setWorkerResp(errorCommonWorkerResponse(fmt.Sprintf("relay worker instance for source %s not found, please `start-relay` first", source), source, ""))
+				continue
 			}
-			resp, err := worker.SendRequest(ctx, workerReq, s.cfg.RPCTimeout)
-			var workerResp *pb.CommonWorkerResponse
-			if err != nil {
-				workerResp = errorCommonWorkerResponse(err.Error(), source, worker.BaseInfo().Name)
-			} else {
-				workerResp = resp.PurgeRelay
-			}
-			workerResp.Source = source
-			workerRespCh <- workerResp
-		}(source)
+			wg.Add(1)
+			go func(worker *scheduler.Worker, source string) {
+				defer wg.Done()
+				var workerResp *pb.CommonWorkerResponse
+				resp, err3 := worker.SendRequest(ctx, workerReq, s.cfg.RPCTimeout)
+				if err3 != nil {
+					workerResp = errorCommonWorkerResponse(err3.Error(), source, worker.BaseInfo().Name)
+				} else {
+					workerResp = resp.PurgeRelay
+				}
+				workerResp.Source = source
+				setWorkerResp(workerResp)
+			}(worker, source)
+		}
 	}
 	wg.Wait()
 
-	workerRespMap := make(map[string]*pb.CommonWorkerResponse, len(req.Sources))
-	for len(workerRespCh) > 0 {
-		workerResp := <-workerRespCh
-		workerRespMap[workerResp.Source] = workerResp
+	workerRespMap := make(map[string][]*pb.CommonWorkerResponse, len(req.Sources))
+	for _, workerResp := range workerResps {
+		workerRespMap[workerResp.Source] = append(workerRespMap[workerResp.Source], workerResp)
 	}
 
 	sort.Strings(req.Sources)
-	workerResps := make([]*pb.CommonWorkerResponse, 0, len(req.Sources))
+	returnResps := make([]*pb.CommonWorkerResponse, 0, len(req.Sources))
 	for _, worker := range req.Sources {
-		workerResps = append(workerResps, workerRespMap[worker])
+		returnResps = append(returnResps, workerRespMap[worker]...)
 	}
 
 	return &pb.PurgeWorkerRelayResponse{
 		Result:  true,
-		Sources: workerResps,
+		Sources: returnResps,
 	}, nil
 }
 
-// OperateWorkerRelayTask implements MasterServer.OperateWorkerRelayTask
+// OperateWorkerRelayTask implements MasterServer.OperateWorkerRelayTask.
 func (s *Server) OperateWorkerRelayTask(ctx context.Context, req *pb.OperateWorkerRelayRequest) (*pb.OperateWorkerRelayResponse, error) {
 	var (
 		resp2 *pb.OperateWorkerRelayResponse
@@ -858,6 +926,7 @@ func (s *Server) OperateWorkerRelayTask(ctx context.Context, req *pb.OperateWork
 	err := s.scheduler.UpdateExpectRelayStage(expect, req.Sources...)
 	if err != nil {
 		resp.Msg = err.Error()
+		// nolint:nilerr
 		return resp, nil
 	}
 	resp.Result = true
@@ -865,7 +934,7 @@ func (s *Server) OperateWorkerRelayTask(ctx context.Context, req *pb.OperateWork
 	return resp, nil
 }
 
-// getTaskResources gets workers relevant to specified task
+// getTaskResources gets workers relevant to specified task.
 func (s *Server) getTaskResources(task string) []string {
 	s.Lock()
 	defer s.Unlock()
@@ -878,15 +947,24 @@ func (s *Server) getTaskResources(task string) []string {
 	return ret
 }
 
-// getStatusFromWorkers does RPC request to get status from dm-workers
-func (s *Server) getStatusFromWorkers(ctx context.Context, sources []string, taskName string) chan *pb.QueryStatusResponse {
+// getStatusFromWorkers does RPC request to get status from dm-workers.
+func (s *Server) getStatusFromWorkers(ctx context.Context, sources []string, taskName string, relayWorker bool) []*pb.QueryStatusResponse {
 	workerReq := &workerrpc.Request{
 		Type:        workerrpc.CmdQueryStatus,
 		QueryStatus: &pb.QueryStatusRequest{Name: taskName},
 	}
-	workerRespCh := make(chan *pb.QueryStatusResponse, len(sources))
 
-	handleErr := func(err error, source string) bool {
+	var (
+		workerResps  = make([]*pb.QueryStatusResponse, 0, len(sources))
+		workerRespMu sync.Mutex
+	)
+	setWorkerResp := func(resp *pb.QueryStatusResponse) {
+		workerRespMu.Lock()
+		workerResps = append(workerResps, resp)
+		workerRespMu.Unlock()
+	}
+
+	handleErr := func(err error, source string, worker string) {
 		log.L().Error("response error", zap.Error(err))
 		resp := &pb.QueryStatusResponse{
 			Result: false,
@@ -895,47 +973,83 @@ func (s *Server) getStatusFromWorkers(ctx context.Context, sources []string, tas
 				Source: source,
 			},
 		}
-		workerRespCh <- resp
-		return false
+		if worker != "" {
+			resp.SourceStatus.Worker = worker
+		}
+		setWorkerResp(resp)
 	}
 
 	var wg sync.WaitGroup
 	for _, source := range sources {
-		wg.Add(1)
-		go s.ap.Emit(ctx, 0, func(args ...interface{}) {
-			defer wg.Done()
-			sourceID, _ := args[0].(string)
-			worker := s.scheduler.GetWorkerBySource(sourceID)
-			if worker == nil {
-				err := terror.ErrMasterWorkerArgsExtractor.Generatef("%s relevant worker-client not found", sourceID)
-				handleErr(err, sourceID)
-				return
+		var (
+			workers       []*scheduler.Worker
+			workerNameSet = make(map[string]struct{})
+			err2          error
+		)
+		if relayWorker {
+			workers, err2 = s.scheduler.GetRelayWorkers(source)
+			if err2 != nil {
+				handleErr(err2, source, "")
+				continue
 			}
-			resp, err := worker.SendRequest(ctx, workerReq, s.cfg.RPCTimeout)
-			var workerStatus *pb.QueryStatusResponse
-			if err != nil {
-				workerStatus = &pb.QueryStatusResponse{
-					Result:       false,
-					Msg:          err.Error(),
-					SourceStatus: &pb.SourceStatus{},
+			// returned workers is not duplicated
+			for _, w := range workers {
+				workerNameSet[w.BaseInfo().Name] = struct{}{}
+			}
+		}
+
+		// subtask workers may have been found in relay workers
+		taskWorker := s.scheduler.GetWorkerBySource(source)
+		if taskWorker != nil {
+			if _, ok := workerNameSet[taskWorker.BaseInfo().Name]; !ok {
+				workers = append(workers, taskWorker)
+			}
+		}
+
+		if len(workers) == 0 {
+			err := terror.ErrMasterWorkerArgsExtractor.Generatef("%s relevant worker-client not found", source)
+			handleErr(err, source, "")
+			continue
+		}
+
+		for _, worker := range workers {
+			wg.Add(1)
+			go s.ap.Emit(ctx, 0, func(args ...interface{}) {
+				defer wg.Done()
+				sourceID := args[0].(string)
+				w, _ := args[1].(*scheduler.Worker)
+
+				var workerStatus *pb.QueryStatusResponse
+				resp, err := w.SendRequest(ctx, workerReq, s.cfg.RPCTimeout)
+				if err != nil {
+					workerStatus = &pb.QueryStatusResponse{
+						Result:       false,
+						Msg:          err.Error(),
+						SourceStatus: &pb.SourceStatus{},
+					}
+				} else {
+					workerStatus = resp.QueryStatus
 				}
-			} else {
-				workerStatus = resp.QueryStatus
-			}
-			workerStatus.SourceStatus.Source = sourceID
-			workerRespCh <- workerStatus
-		}, func(args ...interface{}) {
-			defer wg.Done()
-			sourceID, _ := args[0].(string)
-			handleErr(terror.ErrMasterNoEmitToken.Generate(sourceID), sourceID)
-		}, source)
+				workerStatus.SourceStatus.Source = sourceID
+				setWorkerResp(workerStatus)
+			}, func(args ...interface{}) {
+				defer wg.Done()
+				sourceID, _ := args[0].(string)
+				w, _ := args[1].(*scheduler.Worker)
+				workerName := ""
+				if w != nil {
+					workerName = w.BaseInfo().Name
+				}
+				handleErr(terror.ErrMasterNoEmitToken.Generate(sourceID), sourceID, workerName)
+			}, source, worker)
+		}
 	}
 	wg.Wait()
-	return workerRespCh
+	return workerResps
 }
 
-// TODO: refine the call stack of this API, query worker configs that we needed only
-func (s *Server) getSourceConfigs(sources []*config.MySQLInstance) (map[string]config.DBConfig, error) {
+// TODO: refine the call stack of this API, query worker configs that we needed only.
+func (s *Server) getSourceConfigs(sources []*config.MySQLInstance) map[string]config.DBConfig {
 	cfgs := make(map[string]config.DBConfig)
 	for _, source := range sources {
 		if cfg := s.scheduler.GetSourceCfgByID(source.SourceID); cfg != nil {
@@ -944,10 +1058,10 @@ func (s *Server) getSourceConfigs(sources []*config.MySQLInstance) (map[string]c
 			cfgs[source.SourceID] = cfg.From
 		}
 	}
-	return cfgs, nil
+	return cfgs
 }
 
-// CheckTask checks legality of task configuration
+// CheckTask checks legality of task configuration.
 func (s *Server) CheckTask(ctx context.Context, req *pb.CheckTaskRequest) (*pb.CheckTaskResponse, error) {
 	var (
 		resp2 *pb.CheckTaskResponse
@@ -958,8 +1072,9 @@ func (s *Server) CheckTask(ctx context.Context, req *pb.CheckTaskRequest) (*pb.C
 		return resp2, err2
 	}
 
-	_, _, err := s.generateSubTask(ctx, req.Task)
+	_, _, err := s.generateSubTask(ctx, req.Task, req.ErrCnt, req.WarnCnt)
 	if err != nil {
+		// nolint:nilerr
 		return &pb.CheckTaskResponse{
 			Result: false,
 			Msg:    err.Error(),
@@ -975,8 +1090,8 @@ func (s *Server) CheckTask(ctx context.Context, req *pb.CheckTaskRequest) (*pb.C
 func parseAndAdjustSourceConfig(ctx context.Context, contents []string) ([]*config.SourceConfig, error) {
 	cfgs := make([]*config.SourceConfig, len(contents))
 	for i, content := range contents {
-		cfg := config.NewSourceConfig()
-		if err := cfg.ParseYaml(content); err != nil {
+		cfg, err := config.ParseYaml(content)
+		if err != nil {
 			return cfgs, err
 		}
 
@@ -1005,6 +1120,18 @@ func parseAndAdjustSourceConfig(ctx context.Context, contents []string) ([]*conf
 	return cfgs, nil
 }
 
+func parseSourceConfig(contents []string) ([]*config.SourceConfig, error) {
+	cfgs := make([]*config.SourceConfig, len(contents))
+	for i, content := range contents {
+		cfg, err := config.ParseYaml(content)
+		if err != nil {
+			return cfgs, err
+		}
+		cfgs[i] = cfg
+	}
+	return cfgs, nil
+}
+
 func adjustTargetDB(ctx context.Context, dbConfig *config.DBConfig) error {
 	cfg := *dbConfig
 	if len(cfg.Password) > 0 {
@@ -1028,6 +1155,7 @@ func adjustTargetDB(ctx context.Context, dbConfig *config.DBConfig) error {
 		config.AdjustTargetDBSessionCfg(dbConfig, version)
 	} else {
 		log.L().Warn("get tidb version", log.ShortError(err))
+		config.AdjustTargetDBTimeZone(dbConfig)
 	}
 	return nil
 }
@@ -1043,12 +1171,23 @@ func (s *Server) OperateSource(ctx context.Context, req *pb.OperateSourceRequest
 		return resp2, err2
 	}
 
-	cfgs, err := parseAndAdjustSourceConfig(ctx, req.Config)
-	resp := &pb.OperateSourceResponse{
-		Result: false,
+	var (
+		cfgs []*config.SourceConfig
+		err  error
+		resp = &pb.OperateSourceResponse{
+			Result: false,
+		}
+	)
+	switch req.Op {
+	case pb.SourceOp_StartSource, pb.SourceOp_UpdateSource:
+		cfgs, err = parseAndAdjustSourceConfig(ctx, req.Config)
+	default:
+		// don't check the upstream connections, because upstream may be inaccessible
+		cfgs, err = parseSourceConfig(req.Config)
 	}
 	if err != nil {
 		resp.Msg = err.Error()
+		// nolint:nilerr
 		return resp, nil
 	}
 
@@ -1063,7 +1202,7 @@ func (s *Server) OperateSource(ctx context.Context, req *pb.OperateSourceRequest
 			err      error
 		)
 		for _, cfg := range cfgs {
-			err = s.scheduler.AddSourceCfg(*cfg)
+			err = s.scheduler.AddSourceCfg(cfg)
 			// return first error and try to revert, so user could copy-paste same start command after error
 			if err != nil {
 				resp.Msg = err.Error()
@@ -1102,7 +1241,7 @@ func (s *Server) OperateSource(ctx context.Context, req *pb.OperateSourceRequest
 
 		for _, sid := range toRemove {
 			boundM[sid] = s.scheduler.GetWorkerBySource(sid)
-			err := s.scheduler.RemoveSourceCfg(sid)
+			err3 := s.scheduler.RemoveSourceCfg(sid)
 			// TODO(lance6716):
 			// user could not copy-paste same command if encounter error halfway:
 			// `operate-source stop  correct-id-1     wrong-id-2`
@@ -1111,14 +1250,25 @@ func (s *Server) OperateSource(ctx context.Context, req *pb.OperateSourceRequest
 			//                       not exist, error
 			// find a way to distinguish this scenario and wrong source id
 			// or give a command to show existing source id
-			if err != nil {
-				resp.Msg = err.Error()
+			if err3 != nil {
+				resp.Msg = err3.Error()
+				// nolint:nilerr
 				return resp, nil
 			}
 		}
 	case pb.SourceOp_ShowSource:
-		for _, id := range s.scheduler.GetSourceCfgIDs() {
+		for _, id := range req.SourceID {
 			boundM[id] = s.scheduler.GetWorkerBySource(id)
+		}
+		for _, cfg := range cfgs {
+			id := cfg.SourceID
+			boundM[id] = s.scheduler.GetWorkerBySource(id)
+		}
+
+		if len(boundM) == 0 {
+			for _, id := range s.scheduler.GetSourceCfgIDs() {
+				boundM[id] = s.scheduler.GetWorkerBySource(id)
+			}
 		}
 	default:
 		resp.Msg = terror.ErrMasterInvalidOperateOp.Generate(req.Op.String(), "source").Error()
@@ -1126,6 +1276,13 @@ func (s *Server) OperateSource(ctx context.Context, req *pb.OperateSourceRequest
 	}
 
 	resp.Result = true
+	// tell user he should use `start-relay` to manually specify relay workers
+	for _, cfg := range cfgs {
+		if cfg.EnableRelay {
+			resp.Msg = "Please use `start-relay` to specify which workers should pull relay log of relay-enabled sources."
+		}
+	}
+
 	var noWorkerMsg string
 	switch req.Op {
 	case pb.SourceOp_StartSource, pb.SourceOp_ShowSource:
@@ -1158,7 +1315,7 @@ func (s *Server) OperateSource(ctx context.Context, req *pb.OperateSourceRequest
 }
 
 // OperateLeader implements MasterServer.OperateLeader
-// Note: this request doesn't need to forward to leader
+// Note: this request doesn't need to forward to leader.
 func (s *Server) OperateLeader(ctx context.Context, req *pb.OperateLeaderRequest) (*pb.OperateLeaderResponse, error) {
 	log.L().Info("", zap.Stringer("payload", req), zap.String("request", "OperateLeader"))
 
@@ -1179,7 +1336,7 @@ func (s *Server) OperateLeader(ctx context.Context, req *pb.OperateLeaderRequest
 	}, nil
 }
 
-func (s *Server) generateSubTask(ctx context.Context, task string) (*config.TaskConfig, []*config.SubTaskConfig, error) {
+func (s *Server) generateSubTask(ctx context.Context, task string, errCnt, warnCnt int64) (*config.TaskConfig, []*config.SubTaskConfig, error) {
 	cfg := config.NewTaskConfig()
 	err := cfg.Decode(task)
 	if err != nil {
@@ -1191,17 +1348,14 @@ func (s *Server) generateSubTask(ctx context.Context, task string) (*config.Task
 		return nil, nil, terror.WithClass(err, terror.ClassDMMaster)
 	}
 
-	sourceCfgs, err := s.getSourceConfigs(cfg.MySQLInstances)
-	if err != nil {
-		return nil, nil, err
-	}
+	sourceCfgs := s.getSourceConfigs(cfg.MySQLInstances)
 
 	stCfgs, err := cfg.SubTaskConfigs(sourceCfgs)
 	if err != nil {
 		return nil, nil, terror.WithClass(err, terror.ClassDMMaster)
 	}
 
-	err = checker.CheckSyncConfigFunc(ctx, stCfgs)
+	err = checker.CheckSyncConfigFunc(ctx, stCfgs, errCnt, warnCnt)
 	if err != nil {
 		return nil, nil, terror.WithClass(err, terror.ClassDMMaster)
 	}
@@ -1211,11 +1365,10 @@ func (s *Server) generateSubTask(ctx context.Context, task string) (*config.Task
 
 func setUseTLS(tlsCfg *config.Security) {
 	if enableTLS(tlsCfg) {
-		atomic.StoreInt32(&useTLS, 1)
+		useTLS.Store(true)
 	} else {
-		atomic.StoreInt32(&useTLS, 0)
+		useTLS.Store(false)
 	}
-
 }
 
 func enableTLS(tlsCfg *config.Security) bool {
@@ -1223,7 +1376,7 @@ func enableTLS(tlsCfg *config.Security) bool {
 		return false
 	}
 
-	if len(tlsCfg.SSLCA) == 0 || len(tlsCfg.SSLCert) == 0 || len(tlsCfg.SSLKey) == 0 {
+	if len(tlsCfg.SSLCA) == 0 {
 		return false
 	}
 
@@ -1259,6 +1412,10 @@ func (s *Server) removeMetaData(ctx context.Context, cfg *config.TaskConfig) err
 	if err != nil {
 		return err
 	}
+	err = s.scheduler.RemoveLoadTask(cfg.Name)
+	if err != nil {
+		return err
+	}
 
 	// set up db and clear meta data in downstream db
 	baseDB, err := conn.DefaultDBProvider.Apply(toDB)
@@ -1291,6 +1448,9 @@ func (s *Server) removeMetaData(ctx context.Context, cfg *config.TaskConfig) err
 		dbutil.TableName(cfg.MetaSchema, cputil.SyncerOnlineDDL(cfg.Name))))
 
 	_, err = dbConn.ExecuteSQL(ctctx, nil, cfg.Name, sqls)
+	if err == nil {
+		metrics.RemoveDDLPending(cfg.Name)
+	}
 	return err
 }
 
@@ -1319,7 +1479,7 @@ Relay:
 	OperateRelay:
 		* pause: related relay status is paused
 		* resume: related relay status is running
-In the above situations, once we find an error in response we should return the error
+In the above situations, once we find an error in response we should return the error.
 */
 func (s *Server) waitOperationOk(ctx context.Context, cli *scheduler.Worker, taskName, sourceID string, masterReq interface{}) (*pb.QueryStatusResponse, error) {
 	var expect pb.Stage
@@ -1376,8 +1536,8 @@ func (s *Server) waitOperationOk(ctx context.Context, cli *scheduler.Worker, tas
 				}
 			}
 		}
-		resp, err := cli.SendRequest(ctx, req, s.cfg.RPCTimeout)
 		var queryResp *pb.QueryStatusResponse
+		resp, err := cli.SendRequest(ctx, req, s.cfg.RPCTimeout)
 		if err != nil {
 			log.L().Error("fail to query operation", zap.Int("retryNum", num), zap.String("task", taskName),
 				zap.String("source", sourceID), zap.Stringer("expect", expect), log.ShortError(err))
@@ -1515,7 +1675,6 @@ func (s *Server) getSourceRespsAfterOperation(ctx context.Context, taskName stri
 }
 
 func (s *Server) listMemberMaster(ctx context.Context, names []string) (*pb.Members_Master, error) {
-
 	resp := &pb.Members_Master{
 		Master: &pb.ListMasterMember{},
 	}
@@ -1523,6 +1682,7 @@ func (s *Server) listMemberMaster(ctx context.Context, names []string) (*pb.Memb
 	memberList, err := s.etcdClient.MemberList(ctx)
 	if err != nil {
 		resp.Master.Msg = err.Error()
+		// nolint:nilerr
 		return resp, nil
 	}
 
@@ -1554,6 +1714,7 @@ func (s *Server) listMemberMaster(ctx context.Context, names []string) (*pb.Memb
 		if len(etcdMember.ClientURLs) == 0 {
 			alive = false
 		} else {
+			// nolint:noctx, bodyclose
 			_, err := client.Get(etcdMember.ClientURLs[0] + "/health")
 			if err != nil {
 				alive = false
@@ -1576,7 +1737,7 @@ func (s *Server) listMemberMaster(ctx context.Context, names []string) (*pb.Memb
 	return resp, nil
 }
 
-func (s *Server) listMemberWorker(ctx context.Context, names []string) (*pb.Members_Worker, error) {
+func (s *Server) listMemberWorker(names []string) *pb.Members_Worker {
 	resp := &pb.Members_Worker{
 		Worker: &pb.ListWorkerMember{},
 	}
@@ -1584,7 +1745,7 @@ func (s *Server) listMemberWorker(ctx context.Context, names []string) (*pb.Memb
 	workerAgents, err := s.scheduler.GetAllWorkers()
 	if err != nil {
 		resp.Worker.Msg = err.Error()
-		return resp, nil
+		return resp
 	}
 
 	all := len(names) == 0
@@ -1612,10 +1773,10 @@ func (s *Server) listMemberWorker(ctx context.Context, names []string) (*pb.Memb
 		return workers[lhs].Name < workers[rhs].Name
 	})
 	resp.Worker.Workers = workers
-	return resp, nil
+	return resp
 }
 
-func (s *Server) listMemberLeader(ctx context.Context, names []string) (*pb.Members_Leader, error) {
+func (s *Server) listMemberLeader(ctx context.Context, names []string) *pb.Members_Leader {
 	resp := &pb.Members_Leader{
 		Leader: &pb.ListLeaderMember{},
 	}
@@ -1629,19 +1790,19 @@ func (s *Server) listMemberLeader(ctx context.Context, names []string) (*pb.Memb
 	_, name, addr, err := s.election.LeaderInfo(ctx)
 	if err != nil {
 		resp.Leader.Msg = err.Error()
-		return resp, nil
+		return resp
 	}
 
 	if !all && !set[name] {
-		return resp, nil
+		return resp
 	}
 
 	resp.Leader.Name = name
 	resp.Leader.Addr = addr
-	return resp, nil
+	return resp
 }
 
-// ListMember list member information
+// ListMember list member information.
 func (s *Server) ListMember(ctx context.Context, req *pb.ListMemberRequest) (*pb.ListMemberResponse, error) {
 	var (
 		resp2 *pb.ListMemberResponse
@@ -1662,11 +1823,7 @@ func (s *Server) ListMember(ctx context.Context, req *pb.ListMemberRequest) (*pb
 	members := make([]*pb.Members, 0)
 
 	if req.Leader {
-		res, err := s.listMemberLeader(ctx, req.Names)
-		if err != nil {
-			resp.Msg = err.Error()
-			return resp, nil
-		}
+		res := s.listMemberLeader(ctx, req.Names)
 		members = append(members, &pb.Members{
 			Member: res,
 		})
@@ -1676,6 +1833,7 @@ func (s *Server) ListMember(ctx context.Context, req *pb.ListMemberRequest) (*pb
 		res, err := s.listMemberMaster(ctx, req.Names)
 		if err != nil {
 			resp.Msg = err.Error()
+			// nolint:nilerr
 			return resp, nil
 		}
 		members = append(members, &pb.Members{
@@ -1684,11 +1842,7 @@ func (s *Server) ListMember(ctx context.Context, req *pb.ListMemberRequest) (*pb
 	}
 
 	if req.Worker {
-		res, err := s.listMemberWorker(ctx, req.Names)
-		if err != nil {
-			resp.Msg = err.Error()
-			return resp, nil
-		}
+		res := s.listMemberWorker(req.Names)
 		members = append(members, &pb.Members{
 			Member: res,
 		})
@@ -1737,11 +1891,13 @@ func (s *Server) OperateSchema(ctx context.Context, req *pb.OperateSchemaRequest
 					Database: req.Database,
 					Table:    req.Table,
 					Schema:   req.Schema,
+					Flush:    req.Flush,
+					Sync:     req.Sync,
 				},
 			}
 
-			resp, err := worker.SendRequest(ctx, &workerReq, s.cfg.RPCTimeout)
 			var workerResp *pb.CommonWorkerResponse
+			resp, err := worker.SendRequest(ctx, &workerReq, s.cfg.RPCTimeout)
 			if err != nil {
 				workerResp = errorCommonWorkerResponse(err.Error(), source, worker.BaseInfo().Name)
 			} else {
@@ -1771,10 +1927,10 @@ func (s *Server) OperateSchema(ctx context.Context, req *pb.OperateSchemaRequest
 	}, nil
 }
 
-func (s *Server) createMasterClientByName(ctx context.Context, name string) (pb.MasterClient, error) {
+func (s *Server) createMasterClientByName(ctx context.Context, name string) (pb.MasterClient, *grpc.ClientConn, error) {
 	listResp, err := s.etcdClient.MemberList(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	clientURLs := []string{}
 	for _, m := range listResp.Members {
@@ -1786,11 +1942,11 @@ func (s *Server) createMasterClientByName(ctx context.Context, name string) (pb.
 		}
 	}
 	if len(clientURLs) == 0 {
-		return nil, errors.New("master not found")
+		return nil, nil, errors.New("master not found")
 	}
 	tls, err := toolutils.NewTLS(s.cfg.SSLCA, s.cfg.SSLCert, s.cfg.SSLKey, s.cfg.AdvertiseAddr, s.cfg.CertAllowedCN)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var conn *grpc.ClientConn
@@ -1799,15 +1955,15 @@ func (s *Server) createMasterClientByName(ctx context.Context, name string) (pb.
 		conn, err = grpc.Dial(clientURL, tls.ToGRPCDialOption(), grpc.WithBackoffMaxDelay(3*time.Second))
 		if err == nil {
 			masterClient := pb.NewMasterClient(conn)
-			return masterClient, nil
+			return masterClient, conn, nil
 		}
 		log.L().Error("can not dial to master", zap.String("name", name), zap.String("client url", clientURL), log.ShortError(err))
 	}
 	// return last err
-	return nil, err
+	return nil, nil, err
 }
 
-// GetMasterCfg implements MasterServer.GetMasterCfg
+// GetMasterCfg implements MasterServer.GetMasterCfg.
 func (s *Server) GetMasterCfg(ctx context.Context, req *pb.GetMasterCfgRequest) (*pb.GetMasterCfgResponse, error) {
 	log.L().Info("", zap.Any("payload", req), zap.String("request", "GetMasterCfg"))
 
@@ -1817,7 +1973,7 @@ func (s *Server) GetMasterCfg(ctx context.Context, req *pb.GetMasterCfgRequest) 
 	return resp, err
 }
 
-// GetCfg implements MasterServer.GetCfg
+// GetCfg implements MasterServer.GetCfg.
 func (s *Server) GetCfg(ctx context.Context, req *pb.GetCfgRequest) (*pb.GetCfgResponse, error) {
 	var (
 		resp2 = &pb.GetCfgResponse{}
@@ -1859,14 +2015,17 @@ func (s *Server) GetCfg(ctx context.Context, req *pb.GetCfgRequest) (*pb.GetCfgR
 			return resp2, nil
 		}
 
-		masterClient, err := s.createMasterClientByName(ctx, req.Name)
+		masterClient, grpcConn, err := s.createMasterClientByName(ctx, req.Name)
 		if err != nil {
 			resp2.Msg = err.Error()
+			// nolint:nilerr
 			return resp2, nil
 		}
+		defer grpcConn.Close()
 		masterResp, err := masterClient.GetMasterCfg(ctx, &pb.GetMasterCfgRequest{})
 		if err != nil {
 			resp2.Msg = err.Error()
+			// nolint:nilerr
 			return resp2, nil
 		}
 		cfg = masterResp.Cfg
@@ -1883,6 +2042,7 @@ func (s *Server) GetCfg(ctx context.Context, req *pb.GetCfgRequest) (*pb.GetCfgR
 		workerResp, err := worker.SendRequest(ctx, &workerReq, s.cfg.RPCTimeout)
 		if err != nil {
 			resp2.Msg = err.Error()
+			// nolint:nilerr
 			return resp2, nil
 		}
 		cfg = workerResp.GetWorkerCfg.Cfg
@@ -1890,12 +2050,14 @@ func (s *Server) GetCfg(ctx context.Context, req *pb.GetCfgRequest) (*pb.GetCfgR
 		sourceCfg := s.scheduler.GetSourceCfgByID(req.Name)
 		if sourceCfg == nil {
 			resp2.Msg = "source not found"
+
 			return resp2, nil
 		}
 		sourceCfg.From.Password = "******"
 		cfg, err2 = sourceCfg.Yaml()
 		if err2 != nil {
 			resp2.Msg = err2.Error()
+			// nolint:nilerr
 			return resp2, nil
 		}
 	default:
@@ -1909,7 +2071,7 @@ func (s *Server) GetCfg(ctx context.Context, req *pb.GetCfgRequest) (*pb.GetCfgR
 	}, nil
 }
 
-// HandleError implements MasterServer.HandleError
+// HandleError implements MasterServer.HandleError.
 func (s *Server) HandleError(ctx context.Context, req *pb.HandleErrorRequest) (*pb.HandleErrorResponse, error) {
 	var (
 		resp2 *pb.HandleErrorResponse
@@ -1953,8 +2115,8 @@ func (s *Server) HandleError(ctx context.Context, req *pb.HandleErrorRequest) (*
 				workerRespCh <- errorCommonWorkerResponse(fmt.Sprintf("source %s relevant worker-client not found", source), source, "")
 				return
 			}
-			resp, err := worker.SendRequest(ctx, &workerReq, s.cfg.RPCTimeout)
 			var workerResp *pb.CommonWorkerResponse
+			resp, err := worker.SendRequest(ctx, &workerReq, s.cfg.RPCTimeout)
 			if err != nil {
 				workerResp = errorCommonWorkerResponse(err.Error(), source, worker.BaseInfo().Name)
 			} else {
@@ -1982,7 +2144,7 @@ func (s *Server) HandleError(ctx context.Context, req *pb.HandleErrorRequest) (*
 	}, nil
 }
 
-// TransferSource implements MasterServer.TransferSource
+// TransferSource implements MasterServer.TransferSource.
 func (s *Server) TransferSource(ctx context.Context, req *pb.TransferSourceRequest) (*pb.TransferSourceResponse, error) {
 	var (
 		resp2 = &pb.TransferSourceResponse{}
@@ -1996,6 +2158,36 @@ func (s *Server) TransferSource(ctx context.Context, req *pb.TransferSourceReque
 	err := s.scheduler.TransferSource(req.Source, req.Worker)
 	if err != nil {
 		resp2.Msg = err.Error()
+		// nolint:nilerr
+		return resp2, nil
+	}
+	resp2.Result = true
+	return resp2, nil
+}
+
+// OperateRelay implements MasterServer.OperateRelay.
+func (s *Server) OperateRelay(ctx context.Context, req *pb.OperateRelayRequest) (*pb.OperateRelayResponse, error) {
+	var (
+		resp2 = &pb.OperateRelayResponse{}
+		err   error
+	)
+	shouldRet := s.sharedLogic(ctx, req, &resp2, &err)
+	if shouldRet {
+		return resp2, err
+	}
+
+	switch req.Op {
+	case pb.RelayOpV2_StartRelayV2:
+		err = s.scheduler.StartRelay(req.Source, req.Worker)
+	case pb.RelayOpV2_StopRelayV2:
+		err = s.scheduler.StopRelay(req.Source, req.Worker)
+	default:
+		// should not happen
+		return resp2, fmt.Errorf("only support start-relay or stop-relay, op: %s", req.Op.String())
+	}
+	if err != nil {
+		resp2.Msg = err.Error()
+		// nolint:nilerr
 		return resp2, nil
 	}
 	resp2.Result = true
@@ -2004,8 +2196,9 @@ func (s *Server) TransferSource(ctx context.Context, req *pb.TransferSourceReque
 
 // sharedLogic does some shared logic for each RPC implementation
 // arguments with `Pointer` suffix should be pointer to that variable its name indicated
-// return `true` means caller should return with variable that `xxPointer` modified
+// return `true` means caller should return with variable that `xxPointer` modified.
 func (s *Server) sharedLogic(ctx context.Context, req interface{}, respPointer interface{}, errPointer *error) bool {
+	// nolint:dogsled
 	pc, _, _, _ := runtime.Caller(1)
 	fullMethodName := runtime.FuncForPC(pc).Name()
 	methodName := fullMethodName[strings.LastIndexByte(fullMethodName, '.')+1:]
@@ -2025,7 +2218,7 @@ func (s *Server) sharedLogic(ctx context.Context, req interface{}, respPointer i
 		return false
 	}
 	if needForward {
-		log.L().Info("will forward after a short interval", zap.String("from", s.cfg.Name), zap.String("to", s.leader.Get()), zap.String("request", methodName))
+		log.L().Info("will forward after a short interval", zap.String("from", s.cfg.Name), zap.String("to", s.leader.Load()), zap.String("request", methodName))
 		time.Sleep(100 * time.Millisecond)
 		params := []reflect.Value{reflect.ValueOf(ctx), reflect.ValueOf(req)}
 		results := reflect.ValueOf(s.leaderClient).MethodByName(methodName).Call(params)

@@ -15,7 +15,6 @@ package dumpling
 
 import (
 	"context"
-	"database/sql"
 	"os"
 	"strings"
 	"time"
@@ -25,28 +24,30 @@ import (
 	"github.com/pingcap/failpoint"
 	filter "github.com/pingcap/tidb-tools/pkg/table-filter"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/siddontang/go/sync2"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/dm/config"
 	"github.com/pingcap/dm/dm/pb"
 	"github.com/pingcap/dm/dm/unit"
+	"github.com/pingcap/dm/pkg/conn"
+	dutils "github.com/pingcap/dm/pkg/dumpling"
 	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dm/pkg/terror"
 	"github.com/pingcap/dm/pkg/utils"
 )
 
-// Dumpling dumps full data from a MySQL-compatible database
+// Dumpling dumps full data from a MySQL-compatible database.
 type Dumpling struct {
 	cfg *config.SubTaskConfig
 
 	logger log.Logger
 
 	dumpConfig *export.Config
-	closed     sync2.AtomicBool
+	closed     atomic.Bool
 }
 
-// NewDumpling creates a new Dumpling
+// NewDumpling creates a new Dumpling.
 func NewDumpling(cfg *config.SubTaskConfig) *Dumpling {
 	m := &Dumpling{
 		cfg:    cfg,
@@ -55,16 +56,19 @@ func NewDumpling(cfg *config.SubTaskConfig) *Dumpling {
 	return m
 }
 
-// Init implements Unit.Init
+// Init implements Unit.Init.
 func (m *Dumpling) Init(ctx context.Context) error {
 	var err error
-	m.dumpConfig, err = m.constructArgs()
+	if m.dumpConfig, err = m.constructArgs(); err != nil {
+		return err
+	}
 	m.detectSQLMode(ctx)
+	m.dumpConfig.SessionParams["time_zone"] = "+00:00"
 	m.logger.Info("create dumpling", zap.Stringer("config", m.dumpConfig))
-	return err
+	return nil
 }
 
-// Process implements Unit.Process
+// Process implements Unit.Process.
 func (m *Dumpling) Process(ctx context.Context, pr chan pb.ProcessResult) {
 	dumplingExitWithErrorCounter.WithLabelValues(m.cfg.Name, m.cfg.SourceID).Add(0)
 
@@ -145,29 +149,29 @@ func (m *Dumpling) Process(ctx context.Context, pr chan pb.ProcessResult) {
 	}
 }
 
-// Close implements Unit.Close
+// Close implements Unit.Close.
 func (m *Dumpling) Close() {
-	if m.closed.Get() {
+	if m.closed.Load() {
 		return
 	}
 
 	m.removeLabelValuesWithTaskInMetrics(m.cfg.Name, m.cfg.SourceID)
 	// do nothing, external will cancel the command (if running)
-	m.closed.Set(true)
+	m.closed.Store(true)
 }
 
-// Pause implements Unit.Pause
+// Pause implements Unit.Pause.
 func (m *Dumpling) Pause() {
-	if m.closed.Get() {
+	if m.closed.Load() {
 		m.logger.Warn("try to pause, but already closed")
 		return
 	}
 	// do nothing, external will cancel the command (if running)
 }
 
-// Resume implements Unit.Resume
+// Resume implements Unit.Resume.
 func (m *Dumpling) Resume(ctx context.Context, pr chan pb.ProcessResult) {
-	if m.closed.Get() {
+	if m.closed.Load() {
 		m.logger.Warn("try to resume, but already closed")
 		return
 	}
@@ -175,29 +179,29 @@ func (m *Dumpling) Resume(ctx context.Context, pr chan pb.ProcessResult) {
 	m.Process(ctx, pr)
 }
 
-// Update implements Unit.Update
+// Update implements Unit.Update.
 func (m *Dumpling) Update(cfg *config.SubTaskConfig) error {
 	// not support update configuration now
 	return nil
 }
 
-// Status implements Unit.Status
-func (m *Dumpling) Status(ctx context.Context) interface{} {
+// Status implements Unit.Status.
+func (m *Dumpling) Status() interface{} {
 	// NOTE: try to add some status, like dumped file count
 	return &pb.DumpStatus{}
 }
 
-// Type implements Unit.Type
+// Type implements Unit.Type.
 func (m *Dumpling) Type() pb.UnitType {
 	return pb.UnitType_Dump
 }
 
-// IsFreshTask implements Unit.IsFreshTask
+// IsFreshTask implements Unit.IsFreshTask.
 func (m *Dumpling) IsFreshTask(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// constructArgs constructs arguments for exec.Command
+// constructArgs constructs arguments for exec.Command.
 func (m *Dumpling) constructArgs() (*export.Config, error) {
 	cfg := m.cfg
 	db := cfg.From
@@ -219,12 +223,16 @@ func (m *Dumpling) constructArgs() (*export.Config, error) {
 	dumpConfig.TableFilter = tableFilter
 	dumpConfig.CompleteInsert = true // always keep column name in `INSERT INTO` statements.
 	dumpConfig.Logger = m.logger.Logger
+	// force using UTC timezone
+	dumpConfig.SessionParams = map[string]interface{}{
+		"time_zone": "+00:00",
+	}
 
 	if cfg.Threads > 0 {
 		dumpConfig.Threads = cfg.Threads
 	}
 	if cfg.ChunkFilesize != "" {
-		dumpConfig.FileSize, err = parseFileSize(cfg.ChunkFilesize)
+		dumpConfig.FileSize, err = dutils.ParseFileSize(cfg.ChunkFilesize, export.UnspecifiedSize)
 		if err != nil {
 			m.logger.Warn("parsed some unsupported arguments", zap.Error(err))
 			return nil, err
@@ -261,6 +269,10 @@ func (m *Dumpling) constructArgs() (*export.Config, error) {
 	if dumpConfig.Consistency == "none" {
 		dumpConfig.PosAfterConnect = true
 	}
+	// set default Rows
+	if dumpConfig.Rows == export.UnspecifiedSize {
+		dumpConfig.Rows = 200000
+	}
 
 	if !cfg.CaseSensitive {
 		dumpConfig.TableFilter = filter.CaseInsensitive(dumpConfig.TableFilter)
@@ -272,13 +284,14 @@ func (m *Dumpling) constructArgs() (*export.Config, error) {
 }
 
 // detectSQLMode tries to detect SQL mode from upstream. If success, write it to LoaderConfig.
-// Because loader will use this SQL mode, we need to treat disable `EscapeBackslash` when NO_BACKSLASH_ESCAPES
+// Because loader will use this SQL mode, we need to treat disable `EscapeBackslash` when NO_BACKSLASH_ESCAPES.
 func (m *Dumpling) detectSQLMode(ctx context.Context) {
-	db, err := sql.Open("mysql", m.dumpConfig.GetDSN(""))
+	baseDB, err := conn.DefaultDBProvider.Apply(m.cfg.From)
 	if err != nil {
 		return
 	}
-	defer db.Close()
+	defer baseDB.Close()
+	db := baseDB.DB
 
 	sqlMode, err := utils.GetGlobalVariable(ctx, db, "sql_mode")
 	if err != nil {

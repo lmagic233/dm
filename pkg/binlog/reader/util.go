@@ -17,10 +17,10 @@ import (
 	"context"
 	"fmt"
 
+	gmysql "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/google/uuid"
 	"github.com/pingcap/errors"
-	gmysql "github.com/siddontang/go-mysql/mysql"
-	"github.com/siddontang/go-mysql/replication"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/pkg/binlog/event"
@@ -30,26 +30,14 @@ import (
 	"github.com/pingcap/dm/relay/common"
 )
 
-// GetGTIDsForPos tries to get GTID sets for the specified binlog position (for the corresponding txn).
-// NOTE: this method is very similar with `relay/writer/file_util.go/getTxnPosGTIDs`, unify them if needed later.
-// NOTE: this method is not well tested directly, but more tests have already been done for `relay/writer/file_util.go/getTxnPosGTIDs`.
-func GetGTIDsForPos(ctx context.Context, r Reader, endPos gmysql.Position) (gtid.Set, error) {
-	// start to get and parse binlog event from the beginning of the file.
-	startPos := gmysql.Position{
-		Name: endPos.Name,
-		Pos:  0,
-	}
-	err := r.StartSyncByPos(startPos)
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-
+// GetGTIDsForPosFromStreamer tries to get GTID sets for the specified binlog position (for the corresponding txn) from a Streamer.
+func GetGTIDsForPosFromStreamer(ctx context.Context, r Streamer, endPos gmysql.Position) (gtid.Set, error) {
 	var (
 		flavor      string
 		latestPos   uint32
 		latestGSet  gmysql.GTIDSet
 		nextGTIDStr string // can be recorded if the coming transaction completed
+		err         error
 	)
 	for {
 		var e *replication.BinlogEvent
@@ -92,14 +80,14 @@ func GetGTIDsForPos(ctx context.Context, r Reader, endPos gmysql.Position) (gtid
 			if latestGSet == nil {
 				return nil, errors.Errorf("should have a PreviousGTIDsEvent before the GTIDEvent %+v", e.Header)
 			}
-			// learn from: https://github.com/siddontang/go-mysql/blob/c6ab05a85eb86dc51a27ceed6d2f366a32874a24/replication/binlogsyncer.go#L736
+			// learn from: https://github.com/go-mysql-org/go-mysql/blob/c6ab05a85eb86dc51a27ceed6d2f366a32874a24/replication/binlogsyncer.go#L736
 			u, _ := uuid.FromBytes(ev.SID)
 			nextGTIDStr = fmt.Sprintf("%s:%d", u.String(), ev.GNO)
 		case *replication.MariadbGTIDEvent:
 			if latestGSet == nil {
 				return nil, errors.Errorf("should have a MariadbGTIDListEvent before the MariadbGTIDEvent %+v", e.Header)
 			}
-			// learn from: https://github.com/siddontang/go-mysql/blob/c6ab05a85eb86dc51a27ceed6d2f366a32874a24/replication/binlogsyncer.go#L745
+			// learn from: https://github.com/go-mysql-org/go-mysql/blob/c6ab05a85eb86dc51a27ceed6d2f366a32874a24/replication/binlogsyncer.go#L745
 			GTID := ev.GTID
 			nextGTIDStr = fmt.Sprintf("%d-%d-%d", GTID.DomainID, GTID.ServerID, GTID.SequenceNumber)
 		case *replication.PreviousGTIDsEvent:
@@ -141,8 +129,26 @@ func GetGTIDsForPos(ctx context.Context, r Reader, endPos gmysql.Position) (gtid
 	}
 }
 
+// GetGTIDsForPos tries to get GTID sets for the specified binlog position (for the corresponding txn).
+// NOTE: this method is very similar with `relay/writer/file_util.go/getTxnPosGTIDs`, unify them if needed later.
+// NOTE: this method is not well tested directly, but more tests have already been done for `relay/writer/file_util.go/getTxnPosGTIDs`.
+func GetGTIDsForPos(ctx context.Context, r Reader, endPos gmysql.Position) (gtid.Set, error) {
+	// start to get and parse binlog event from the beginning of the file.
+	startPos := gmysql.Position{
+		Name: endPos.Name,
+		Pos:  0,
+	}
+	err := r.StartSyncByPos(startPos)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	return GetGTIDsForPosFromStreamer(ctx, r, endPos)
+}
+
 // GetPreviousGTIDFromGTIDSet tries to get previous GTID sets from Previous_GTID_EVENT GTID for the specified GITD Set.
-// events should be [fake_rotate_event,format_description_event,previous_gtids_event/mariadb_gtid_list_event]
+// events should be [fake_rotate_event,format_description_event,previous_gtids_event/mariadb_gtid_list_event].
 func GetPreviousGTIDFromGTIDSet(ctx context.Context, r Reader, gset gtid.Set) (gtid.Set, error) {
 	err := r.StartSyncByGTID(gset)
 	if err != nil {

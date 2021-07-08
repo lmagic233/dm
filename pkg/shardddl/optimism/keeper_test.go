@@ -14,15 +14,30 @@
 package optimism
 
 import (
+	"testing"
+
 	. "github.com/pingcap/check"
 	"github.com/pingcap/parser"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb-tools/pkg/schemacmp"
 	"github.com/pingcap/tidb/util/mock"
+	"go.etcd.io/etcd/integration"
+
+	"github.com/pingcap/dm/pkg/utils"
 )
 
 type testKeeper struct{}
 
 var _ = Suite(&testKeeper{})
+
+func TestKeeper(t *testing.T) {
+	mockCluster := integration.NewClusterV3(t, &integration.ClusterConfig{Size: 1})
+	defer mockCluster.Terminate(t)
+
+	etcdTestCli = mockCluster.RandClient()
+
+	TestingT(t)
+}
 
 func (t *testKeeper) TestLockKeeper(c *C) {
 	var (
@@ -57,10 +72,11 @@ func (t *testKeeper) TestLockKeeper(c *C) {
 	)
 
 	// lock with 2 sources.
-	lockID1, newDDLs, err := lk.TrySync(i11, tts1)
+	lockID1, newDDLs, cols, err := lk.TrySync(etcdTestCli, i11, tts1)
 	c.Assert(err, IsNil)
 	c.Assert(lockID1, Equals, "task1-`foo`.`bar`")
 	c.Assert(newDDLs, DeepEquals, DDLs)
+	c.Assert(cols, DeepEquals, []string{})
 	lock1 := lk.FindLock(lockID1)
 	c.Assert(lock1, NotNil)
 	c.Assert(lock1.ID, Equals, lockID1)
@@ -69,10 +85,11 @@ func (t *testKeeper) TestLockKeeper(c *C) {
 	c.Assert(synced, IsFalse)
 	c.Assert(remain, Equals, 1)
 
-	lockID1, newDDLs, err = lk.TrySync(i12, tts1)
+	lockID1, newDDLs, cols, err = lk.TrySync(etcdTestCli, i12, tts1)
 	c.Assert(err, IsNil)
 	c.Assert(lockID1, Equals, "task1-`foo`.`bar`")
 	c.Assert(newDDLs, DeepEquals, DDLs)
+	c.Assert(cols, DeepEquals, []string{})
 	lock1 = lk.FindLock(lockID1)
 	c.Assert(lock1, NotNil)
 	c.Assert(lock1.ID, Equals, lockID1)
@@ -81,10 +98,11 @@ func (t *testKeeper) TestLockKeeper(c *C) {
 	c.Assert(remain, Equals, 0)
 
 	// lock with only 1 source.
-	lockID2, newDDLs, err := lk.TrySync(i21, tts2)
+	lockID2, newDDLs, cols, err := lk.TrySync(etcdTestCli, i21, tts2)
 	c.Assert(err, IsNil)
 	c.Assert(lockID2, Equals, "task2-`foo`.`bar`")
 	c.Assert(newDDLs, DeepEquals, DDLs)
+	c.Assert(cols, DeepEquals, []string{})
 	lock2 := lk.FindLock(lockID2)
 	c.Assert(lock2, NotNil)
 	c.Assert(lock2.ID, Equals, lockID2)
@@ -150,16 +168,18 @@ func (t *testKeeper) TestLockKeeperMultipleTarget(c *C) {
 	)
 
 	// lock for target1.
-	lockID1, newDDLs, err := lk.TrySync(i11, tts1)
+	lockID1, newDDLs, cols, err := lk.TrySync(etcdTestCli, i11, tts1)
 	c.Assert(err, IsNil)
 	c.Assert(lockID1, DeepEquals, "test-lock-keeper-multiple-target-`foo`.`bar`")
 	c.Assert(newDDLs, DeepEquals, DDLs)
+	c.Assert(cols, DeepEquals, []string{})
 
 	// lock for target2.
-	lockID2, newDDLs, err := lk.TrySync(i21, tts2)
+	lockID2, newDDLs, cols, err := lk.TrySync(etcdTestCli, i21, tts2)
 	c.Assert(err, IsNil)
 	c.Assert(lockID2, DeepEquals, "test-lock-keeper-multiple-target-`foo`.`rab`")
 	c.Assert(newDDLs, DeepEquals, DDLs)
+	c.Assert(cols, DeepEquals, []string{})
 
 	// check two locks exist.
 	lock1 := lk.FindLock(lockID1)
@@ -178,14 +198,16 @@ func (t *testKeeper) TestLockKeeperMultipleTarget(c *C) {
 	c.Assert(remain, Equals, 1)
 
 	// sync for two locks.
-	lockID1, newDDLs, err = lk.TrySync(i12, tts1)
+	lockID1, newDDLs, cols, err = lk.TrySync(etcdTestCli, i12, tts1)
 	c.Assert(err, IsNil)
 	c.Assert(lockID1, DeepEquals, "test-lock-keeper-multiple-target-`foo`.`bar`")
 	c.Assert(newDDLs, DeepEquals, DDLs)
-	lockID2, newDDLs, err = lk.TrySync(i22, tts2)
+	c.Assert(cols, DeepEquals, []string{})
+	lockID2, newDDLs, cols, err = lk.TrySync(etcdTestCli, i22, tts2)
 	c.Assert(err, IsNil)
 	c.Assert(lockID2, DeepEquals, "test-lock-keeper-multiple-target-`foo`.`rab`")
 	c.Assert(newDDLs, DeepEquals, DDLs)
+	c.Assert(cols, DeepEquals, []string{})
 
 	lock1 = lk.FindLock(lockID1)
 	c.Assert(lock1, NotNil)
@@ -390,4 +412,74 @@ func (t *testKeeper) TestTargetTablesForTask(c *C) {
 				"foo-1": {"bar-3": struct{}{}, "bar-4": struct{}{}},
 			}),
 	})
+}
+
+func (t *testKeeper) TestRebuildLocksAndTables(c *C) {
+	defer clearTestInfoOperation(c)
+	var (
+		lk               = NewLockKeeper()
+		task             = "task"
+		source1          = "mysql-replica-1"
+		source2          = "mysql-replica-2"
+		upSchema         = "foo"
+		upTable          = "bar"
+		downSchema       = "db"
+		downTable        = "tbl"
+		DDLs1            = []string{"ALTER TABLE bar ADD COLUMN c1 INT"}
+		DDLs2            = []string{"ALTER TABLE bar DROP COLUMN c1"}
+		p                = parser.New()
+		se               = mock.NewContext()
+		tblID      int64 = 111
+		ti0              = createTableInfo(c, p, se, tblID, `CREATE TABLE bar (id INT PRIMARY KEY)`)
+		ti1              = createTableInfo(c, p, se, tblID, `CREATE TABLE bar (id INT PRIMARY KEY, c1 INT)`)
+		ti2              = createTableInfo(c, p, se, tblID, `CREATE TABLE bar (id INT PRIMARY KEY, c1 INT, c2 INT)`)
+		ti3              = createTableInfo(c, p, se, tblID, `CREATE TABLE bar (id INT PRIMARY KEY, c2 INT)`)
+
+		i11 = NewInfo(task, source1, upSchema, upTable, downSchema, downTable, DDLs1, ti0, []*model.TableInfo{ti1})
+		i21 = NewInfo(task, source2, upSchema, upTable, downSchema, downTable, DDLs2, ti2, []*model.TableInfo{ti3})
+
+		tts = []TargetTable{
+			newTargetTable(task, source1, downSchema, downTable, map[string]map[string]struct{}{upSchema: {upTable: struct{}{}}}),
+			newTargetTable(task, source2, downSchema, downTable, map[string]map[string]struct{}{upSchema: {upTable: struct{}{}}}),
+		}
+
+		lockID = utils.GenDDLLockID(task, downSchema, downTable)
+
+		ifm = map[string]map[string]map[string]map[string]Info{
+			task: {
+				source1: {upSchema: {upTable: i11}},
+				source2: {upSchema: {upTable: i21}},
+			},
+		}
+		colm = map[string]map[string]map[string]map[string]map[string]DropColumnStage{
+			lockID: {
+				"c3": {
+					source1: {upSchema: {upTable: DropNotDone}},
+					source2: {upSchema: {upTable: DropNotDone}},
+				},
+			},
+		}
+		lockJoined = map[string]schemacmp.Table{
+			lockID: schemacmp.Encode(ti2),
+		}
+		lockTTS = map[string][]TargetTable{
+			lockID: tts,
+		}
+	)
+
+	lk.RebuildLocksAndTables(etcdTestCli, ifm, colm, lockJoined, lockTTS, nil)
+	locks := lk.Locks()
+	c.Assert(len(locks), Equals, 1)
+	lock, ok := locks[lockID]
+	c.Assert(ok, IsTrue)
+	cmp, err := lock.Joined().Compare(schemacmp.Encode(ti2))
+	c.Assert(err, IsNil)
+	c.Assert(cmp, Equals, 0)
+	cmp, err = lock.tables[source1][upSchema][upTable].Compare(schemacmp.Encode(ti0))
+	c.Assert(err, IsNil)
+	c.Assert(cmp, Equals, 0)
+	cmp, err = lock.tables[source2][upSchema][upTable].Compare(schemacmp.Encode(ti2))
+	c.Assert(err, IsNil)
+	c.Assert(cmp, Equals, 0)
+	c.Assert(lock.columns, DeepEquals, colm[lockID])
 }

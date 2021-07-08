@@ -21,7 +21,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/siddontang/go-mysql/mysql"
+	"github.com/docker/go-units"
+	"github.com/go-mysql-org/go-mysql/mysql"
 
 	"github.com/pingcap/dm/pkg/binlog"
 	"github.com/pingcap/dm/pkg/gtid"
@@ -177,9 +178,25 @@ func readFollowingGTIDs(br *bufio.Reader, flavor string) (string, error) {
 		// try parse to verify it
 		_, err = gtid.ParserGTID(flavor, line[:end])
 		if err != nil {
+			// nolint:nilerr
 			return following.String(), nil // return the previous, not including this non-GTID line.
 		}
 
 		following.WriteString(line)
 	}
+}
+
+// ParseFileSize parses the size in MiB from input.
+func ParseFileSize(fileSizeStr string, defaultSize uint64) (uint64, error) {
+	var fileSize uint64
+	if len(fileSizeStr) == 0 {
+		fileSize = defaultSize
+	} else if fileSizeMB, err := strconv.ParseUint(fileSizeStr, 10, 64); err == nil {
+		fileSize = fileSizeMB * units.MiB
+	} else if size, err := units.RAMInBytes(fileSizeStr); err == nil {
+		fileSize = uint64(size)
+	} else {
+		return 0, err
+	}
+	return fileSize, nil
 }

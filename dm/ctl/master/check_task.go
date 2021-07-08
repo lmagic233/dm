@@ -25,27 +25,37 @@ import (
 	"github.com/pingcap/dm/dm/pb"
 )
 
-// NewCheckTaskCmd creates a CheckTask command
+// NewCheckTaskCmd creates a CheckTask command.
 func NewCheckTaskCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "check-task <config-file>",
+		Use:   "check-task <config-file> [--error count] [--warn count]",
 		Short: "Checks the configuration file of the task.",
 		RunE:  checkTaskFunc,
 	}
+	cmd.Flags().Int64P("error", "e", common.DefaultErrorCnt, "max count of errors to display")
+	cmd.Flags().Int64P("warn", "w", common.DefaultWarnCnt, "max count of warns to display")
 	return cmd
 }
 
-// checkTaskFunc does check task request
-func checkTaskFunc(cmd *cobra.Command, _ []string) (err error) {
+// checkTaskFunc does check task request.
+func checkTaskFunc(cmd *cobra.Command, _ []string) error {
 	if len(cmd.Flags().Args()) != 1 {
 		cmd.SetOut(os.Stdout)
 		common.PrintCmdUsage(cmd)
-		err = errors.New("please check output to see error")
-		return
+		return errors.New("please check output to see error")
 	}
 	content, err := common.GetFileContent(cmd.Flags().Arg(0))
 	if err != nil {
-		return
+		return err
+	}
+
+	errCnt, err := cmd.Flags().GetInt64("error")
+	if err != nil {
+		return err
+	}
+	warnCnt, err := cmd.Flags().GetInt64("warn")
+	if err != nil {
+		return err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -57,17 +67,19 @@ func checkTaskFunc(cmd *cobra.Command, _ []string) (err error) {
 		ctx,
 		"CheckTask",
 		&pb.CheckTaskRequest{
-			Task: string(content),
+			Task:    string(content),
+			ErrCnt:  errCnt,
+			WarnCnt: warnCnt,
 		},
 		&resp,
 	)
 
 	if err != nil {
-		return
+		return err
 	}
 
 	if !common.PrettyPrintResponseWithCheckTask(resp, checker.ErrorMsgHeader) {
 		common.PrettyPrintResponse(resp)
 	}
-	return
+	return nil
 }

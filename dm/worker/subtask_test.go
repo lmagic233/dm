@@ -23,6 +23,7 @@ import (
 	"github.com/pingcap/dm/dm/unit"
 	"github.com/pingcap/dm/dumpling"
 	"github.com/pingcap/dm/loader"
+	"github.com/pingcap/dm/pkg/utils"
 	"github.com/pingcap/dm/syncer"
 
 	. "github.com/pingcap/check"
@@ -31,7 +32,7 @@ import (
 )
 
 const (
-	// mocked loadMetaBinlog must be greater than relayHolderBinlog
+	// mocked loadMetaBinlog must be greater than relayHolderBinlog.
 	loadMetaBinlog    = "(mysql-bin.00001,154)"
 	relayHolderBinlog = "(mysql-bin.00001,150)"
 )
@@ -44,10 +45,11 @@ func (t *testSubTask) TestCreateUnits(c *C) {
 	cfg := &config.SubTaskConfig{
 		Mode: "xxx",
 	}
-	c.Assert(createUnits(cfg, nil), HasLen, 0)
+	worker := "worker"
+	c.Assert(createUnits(cfg, nil, worker), HasLen, 0)
 
 	cfg.Mode = config.ModeFull
-	unitsFull := createUnits(cfg, nil)
+	unitsFull := createUnits(cfg, nil, worker)
 	c.Assert(unitsFull, HasLen, 2)
 	_, ok := unitsFull[0].(*dumpling.Dumpling)
 	c.Assert(ok, IsTrue)
@@ -55,13 +57,13 @@ func (t *testSubTask) TestCreateUnits(c *C) {
 	c.Assert(ok, IsTrue)
 
 	cfg.Mode = config.ModeIncrement
-	unitsIncr := createUnits(cfg, nil)
+	unitsIncr := createUnits(cfg, nil, worker)
 	c.Assert(unitsIncr, HasLen, 1)
 	_, ok = unitsIncr[0].(*syncer.Syncer)
 	c.Assert(ok, IsTrue)
 
 	cfg.Mode = config.ModeAll
-	unitsAll := createUnits(cfg, nil)
+	unitsAll := createUnits(cfg, nil, worker)
 	c.Assert(unitsAll, HasLen, 3)
 	_, ok = unitsAll[0].(*dumpling.Dumpling)
 	c.Assert(ok, IsTrue)
@@ -76,10 +78,10 @@ type MockUnit struct {
 	errInit        error
 	errUpdate      error
 
-	isFresh  bool
 	errFresh error
 
-	typ pb.UnitType
+	typ     pb.UnitType
+	isFresh bool
 }
 
 func NewMockUnit(typ pb.UnitType) *MockUnit {
@@ -122,7 +124,7 @@ func (m *MockUnit) Update(_ *config.SubTaskConfig) error {
 	return m.errUpdate
 }
 
-func (m *MockUnit) Status(ctx context.Context) interface{} {
+func (m *MockUnit) Status() interface{} {
 	switch m.typ {
 	case pb.UnitType_Check:
 		return &pb.CheckStatus{}
@@ -166,14 +168,14 @@ func (t *testSubTask) TestSubTaskNormalUsage(c *C) {
 		Mode: config.ModeFull,
 	}
 
-	st := NewSubTask(cfg, nil)
+	st := NewSubTask(cfg, nil, "worker")
 	c.Assert(st.Stage(), DeepEquals, pb.Stage_New)
 
 	// test empty and fail
 	defer func() {
 		createUnits = createRealUnits
 	}()
-	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []unit.Unit {
+	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) []unit.Unit {
 		return nil
 	}
 	st.Run(pb.Stage_Running)
@@ -182,7 +184,7 @@ func (t *testSubTask) TestSubTaskNormalUsage(c *C) {
 
 	mockDumper := NewMockUnit(pb.UnitType_Dump)
 	mockLoader := NewMockUnit(pb.UnitType_Load)
-	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []unit.Unit {
+	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) []unit.Unit {
 		return []unit.Unit{mockDumper, mockLoader}
 	}
 
@@ -285,7 +287,7 @@ func (t *testSubTask) TestPauseAndResumeSubtask(c *C) {
 		Mode: config.ModeFull,
 	}
 
-	st := NewSubTask(cfg, nil)
+	st := NewSubTask(cfg, nil, "worker")
 	c.Assert(st.Stage(), DeepEquals, pb.Stage_New)
 
 	mockDumper := NewMockUnit(pb.UnitType_Dump)
@@ -293,7 +295,7 @@ func (t *testSubTask) TestPauseAndResumeSubtask(c *C) {
 	defer func() {
 		createUnits = createRealUnits
 	}()
-	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []unit.Unit {
+	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) []unit.Unit {
 		return []unit.Unit{mockDumper, mockLoader}
 	}
 
@@ -329,7 +331,7 @@ func (t *testSubTask) TestPauseAndResumeSubtask(c *C) {
 		c.Fatalf("result %+v is not right after closing", st.Result())
 	}
 
-	//  resume
+	// resume
 	c.Assert(st.Resume(), IsNil)
 	c.Assert(st.Stage(), Equals, pb.Stage_Running)
 	c.Assert(st.CurrUnit(), Equals, mockDumper)
@@ -351,13 +353,9 @@ func (t *testSubTask) TestPauseAndResumeSubtask(c *C) {
 	// fail dumper
 	c.Assert(mockDumper.InjectProcessError(context.Background(), errors.New("dumper process error")), IsNil)
 	// InjectProcessError need 1 second, here we wait 1.5 second
-	for i := 0; i < 15; i++ {
-		res := st.Result()
-		if res != nil {
-			break
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
+	utils.WaitSomething(15, 100*time.Millisecond, func() bool {
+		return st.Result() != nil
+	})
 	c.Assert(st.CurrUnit(), Equals, mockDumper)
 	c.Assert(st.Result(), NotNil)
 	c.Assert(st.Result().Errors, HasLen, 1)
@@ -384,24 +382,18 @@ func (t *testSubTask) TestPauseAndResumeSubtask(c *C) {
 	c.Assert(st.Result(), IsNil)
 	// finish dump
 	c.Assert(mockDumper.InjectProcessError(context.Background(), nil), IsNil)
-	for i := 0; i < 1000; i++ {
-		if st.CurrUnit().Type() == pb.UnitType_Load {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	utils.WaitSomething(20, 50*time.Millisecond, func() bool {
+		return st.CurrUnit().Type() == pb.UnitType_Load
+	})
 	c.Assert(st.CurrUnit(), Equals, mockLoader)
 	c.Assert(st.Result(), IsNil)
 	c.Assert(st.Stage(), Equals, pb.Stage_Running)
 
 	// finish loader
 	c.Assert(mockLoader.InjectProcessError(context.Background(), nil), IsNil)
-	for i := 0; i < 1000; i++ {
-		if st.Stage() == pb.Stage_Finished {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	utils.WaitSomething(20, 50*time.Millisecond, func() bool {
+		return st.Stage() == pb.Stage_Finished
+	})
 	c.Assert(st.CurrUnit(), Equals, mockLoader)
 	c.Assert(st.Stage(), Equals, pb.Stage_Finished)
 	c.Assert(st.Result().Errors, HasLen, 0)
@@ -423,7 +415,7 @@ func (t *testSubTask) TestSubtaskWithStage(c *C) {
 		Mode: config.ModeFull,
 	}
 
-	st := NewSubTaskWithStage(cfg, pb.Stage_Paused, nil)
+	st := NewSubTaskWithStage(cfg, pb.Stage_Paused, nil, "worker")
 	c.Assert(st.Stage(), DeepEquals, pb.Stage_Paused)
 
 	mockDumper := NewMockUnit(pb.UnitType_Dump)
@@ -431,7 +423,7 @@ func (t *testSubTask) TestSubtaskWithStage(c *C) {
 	defer func() {
 		createUnits = createRealUnits
 	}()
-	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []unit.Unit {
+	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) []unit.Unit {
 		return []unit.Unit{mockDumper, mockLoader}
 	}
 
@@ -454,9 +446,9 @@ func (t *testSubTask) TestSubtaskWithStage(c *C) {
 		c.Fatalf("result %+v is not right after closing", st.Result())
 	}
 
-	st = NewSubTaskWithStage(cfg, pb.Stage_Finished, nil)
+	st = NewSubTaskWithStage(cfg, pb.Stage_Finished, nil, "worker")
 	c.Assert(st.Stage(), DeepEquals, pb.Stage_Finished)
-	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []unit.Unit {
+	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) []unit.Unit {
 		return []unit.Unit{mockDumper, mockLoader}
 	}
 
@@ -498,7 +490,7 @@ func (t *testSubTask) TestSubtaskFastQuit(c *C) {
 	mockLoader := NewMockUnit(pb.UnitType_Load)
 	mockSyncer := NewMockUnit(pb.UnitType_Sync)
 
-	st := NewSubTaskWithStage(cfg, pb.Stage_Paused, nil)
+	st := NewSubTaskWithStage(cfg, pb.Stage_Paused, nil, "worker")
 	st.prevUnit = mockLoader
 	st.currUnit = mockSyncer
 
@@ -519,7 +511,7 @@ func (t *testSubTask) TestSubtaskFastQuit(c *C) {
 	}
 	c.Assert(st.Stage(), Equals, pb.Stage_Paused)
 
-	st = NewSubTaskWithStage(cfg, pb.Stage_Paused, nil)
+	st = NewSubTaskWithStage(cfg, pb.Stage_Paused, nil, "worker")
 	st.prevUnit = mockLoader
 	st.currUnit = mockSyncer
 

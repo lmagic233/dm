@@ -15,10 +15,10 @@ package workerrpc
 
 import (
 	"context"
-	"sync/atomic"
 	"time"
 
 	toolutils "github.com/pingcap/tidb-tools/pkg/utils"
+	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/backoff"
 
@@ -27,23 +27,22 @@ import (
 	"github.com/pingcap/dm/pkg/terror"
 )
 
-// GRPCClient stores raw grpc connection and worker client
+// GRPCClient stores raw grpc connection and worker client.
 type GRPCClient struct {
 	conn   *grpc.ClientConn
 	client pb.WorkerClient
-	closed int32
+	closed atomic.Bool
 }
 
-// NewGRPCClientWrap initializes a new grpc client from given grpc connection and worker client
+// NewGRPCClientWrap initializes a new grpc client from given grpc connection and worker client.
 func NewGRPCClientWrap(conn *grpc.ClientConn, client pb.WorkerClient) (*GRPCClient, error) {
 	return &GRPCClient{
 		conn:   conn,
 		client: client,
-		closed: 0,
 	}, nil
 }
 
-// NewGRPCClient initializes a new grpc client from worker address
+// NewGRPCClient initializes a new grpc client from worker address.
 func NewGRPCClient(addr string, securityCfg config.Security) (*GRPCClient, error) {
 	tls, err := toolutils.NewTLS(securityCfg.SSLCA, securityCfg.SSLCert, securityCfg.SSLKey, addr, securityCfg.CertAllowedCN)
 	if err != nil {
@@ -67,9 +66,9 @@ func NewGRPCClient(addr string, securityCfg config.Security) (*GRPCClient, error
 	return NewGRPCClientWrap(conn, pb.NewWorkerClient(conn))
 }
 
-// SendRequest implements Client.SendRequest
+// SendRequest implements Client.SendRequest.
 func (c *GRPCClient) SendRequest(ctx context.Context, req *Request, timeout time.Duration) (*Response, error) {
-	if atomic.LoadInt32(&c.closed) != 0 {
+	if c.closed.Load() {
 		return nil, terror.ErrMasterGRPCSendOnCloseConn.Generate()
 	}
 	if req.IsStreamAPI() {
@@ -82,20 +81,24 @@ func (c *GRPCClient) SendRequest(ctx context.Context, req *Request, timeout time
 	return callRPC(ctx1, c.client, req)
 }
 
-// Close implements Client.Close
+// Close implements Client.Close.
 func (c *GRPCClient) Close() error {
 	defer func() {
-		atomic.CompareAndSwapInt32(&c.closed, 0, 1)
+		c.closed.CAS(false, true)
 		c.conn = nil
 	}()
 	if c.conn == nil {
 		return nil
 	}
-	err := c.conn.Close()
-	if err != nil {
+	if err := c.conn.Close(); err != nil {
 		return terror.ErrMasterGRPCClientClose.Delegate(err)
 	}
 	return nil
+}
+
+// Closed returns whether this grpc conn is closed. only used for test now.
+func (c *GRPCClient) Closed() bool {
+	return c.closed.Load()
 }
 
 func callRPC(ctx context.Context, client pb.WorkerClient, req *Request) (*Response, error) {

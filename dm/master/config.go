@@ -23,7 +23,6 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync/atomic"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -37,11 +36,15 @@ import (
 )
 
 const (
-	defaultRPCTimeout          = "30s"
-	defaultNamePrefix          = "dm-master"
-	defaultDataDirPrefix       = "default"
-	defaultPeerUrls            = "http://127.0.0.1:8291"
-	defaultInitialClusterState = embed.ClusterStateFlagNew
+	defaultRPCTimeout              = "30s"
+	defaultNamePrefix              = "dm-master"
+	defaultDataDirPrefix           = "default"
+	defaultPeerUrls                = "http://127.0.0.1:8291"
+	defaultInitialClusterState     = embed.ClusterStateFlagNew
+	defaultAutoCompactionMode      = "periodic"
+	defaultAutoCompactionRetention = "1h"
+	defaultQuotaBackendBytes       = 2 * 1024 * 1024 * 1024 // 2GB
+	quotaBackendBytesLowerBound    = 500 * 1024 * 1024      // 500MB
 )
 
 var (
@@ -49,11 +52,11 @@ var (
 	EnableZap = false
 	// SampleConfigFile is sample config file of dm-master
 	// later we can read it from dm/master/dm-master.toml
-	// and assign it to SampleConfigFile while we build dm-master
+	// and assign it to SampleConfigFile while we build dm-master.
 	SampleConfigFile string
 )
 
-// NewConfig creates a config for dm-master
+// NewConfig creates a config for dm-master.
 func NewConfig() *Config {
 	cfg := &Config{}
 	cfg.flagSet = flag.NewFlagSet("dm-master", flag.ContinueOnError)
@@ -67,7 +70,7 @@ func NewConfig() *Config {
 	fs.StringVar(&cfg.LogLevel, "L", "info", "log level: debug, info, warn, error, fatal")
 	fs.StringVar(&cfg.LogFile, "log-file", "", "log file path")
 	fs.StringVar(&cfg.LogFormat, "log-format", "text", `the format of the log, "text" or "json"`)
-	//fs.StringVar(&cfg.LogRotate, "log-rotate", "day", "log file rotate type, hour/day")
+	// fs.StringVar(&cfg.LogRotate, "log-rotate", "day", "log file rotate type, hour/day")
 
 	fs.StringVar(&cfg.Name, "name", "", "human-readable name for this DM-master member")
 	fs.StringVar(&cfg.DataDir, "data-dir", "", `path to the data directory (default "default.${name}")`)
@@ -75,6 +78,9 @@ func NewConfig() *Config {
 	fs.StringVar(&cfg.PeerUrls, "peer-urls", defaultPeerUrls, "URLs for peer traffic")
 	fs.StringVar(&cfg.AdvertisePeerUrls, "advertise-peer-urls", "", `advertise URLs for peer traffic (default "${peer-urls}")`)
 	fs.StringVar(&cfg.Join, "join", "", `join to an existing cluster (usage: cluster's "${master-addr}" list, e.g. "127.0.0.1:8261,127.0.0.1:18261"`)
+	fs.StringVar(&cfg.AutoCompactionMode, "auto-compaction-mode", defaultAutoCompactionMode, `etcd's auto-compaction-mode, either 'periodic' or 'revision'`)
+	fs.StringVar(&cfg.AutoCompactionRetention, "auto-compaction-retention", defaultAutoCompactionRetention, `etcd's auto-compaction-retention, accept values like '5h' or '5' (5 hours in 'periodic' mode or 5 revisions in 'revision')`)
+	fs.Int64Var(&cfg.QuotaBackendBytes, "quota-backend-bytes", defaultQuotaBackendBytes, `etcd's storage quota in bytes`)
 
 	fs.StringVar(&cfg.SSLCA, "ssl-ca", "", "path of file that contains list of trusted SSL CAs for connection")
 	fs.StringVar(&cfg.SSLCert, "ssl-cert", "", "path of file that contains X509 certificate in PEM format for connection")
@@ -86,7 +92,7 @@ func NewConfig() *Config {
 	return cfg
 }
 
-// Config is the configuration for dm-master
+// Config is the configuration for dm-master.
 type Config struct {
 	flagSet *flag.FlagSet
 
@@ -108,13 +114,16 @@ type Config struct {
 	// etcd relative config items
 	// NOTE: we use `MasterAddr` to generate `ClientUrls` and `AdvertiseClientUrls`
 	// NOTE: more items will be add when adding leader election
-	Name                string `toml:"name" json:"name"`
-	DataDir             string `toml:"data-dir" json:"data-dir"`
-	PeerUrls            string `toml:"peer-urls" json:"peer-urls"`
-	AdvertisePeerUrls   string `toml:"advertise-peer-urls" json:"advertise-peer-urls"`
-	InitialCluster      string `toml:"initial-cluster" json:"initial-cluster"`
-	InitialClusterState string `toml:"initial-cluster-state" json:"initial-cluster-state"`
-	Join                string `toml:"join" json:"join"` // cluster's client address (endpoints), not peer address
+	Name                    string `toml:"name" json:"name"`
+	DataDir                 string `toml:"data-dir" json:"data-dir"`
+	PeerUrls                string `toml:"peer-urls" json:"peer-urls"`
+	AdvertisePeerUrls       string `toml:"advertise-peer-urls" json:"advertise-peer-urls"`
+	InitialCluster          string `toml:"initial-cluster" json:"initial-cluster"`
+	InitialClusterState     string `toml:"initial-cluster-state" json:"initial-cluster-state"`
+	Join                    string `toml:"join" json:"join"` // cluster's client address (endpoints), not peer address
+	AutoCompactionMode      string `toml:"auto-compaction-mode" json:"auto-compaction-mode"`
+	AutoCompactionRetention string `toml:"auto-compaction-retention" json:"auto-compaction-retention"`
+	QuotaBackendBytes       int64  `toml:"quota-backend-bytes" json:"quota-backend-bytes"`
 
 	// directory path used to store source config files when upgrading from v1.0.x.
 	// if this path set, DM-master leader will try to upgrade from v1.0.x to the current version.
@@ -128,7 +137,6 @@ type Config struct {
 }
 
 func (c *Config) String() string {
-	//nolint:staticcheck
 	cfg, err := json.Marshal(c)
 	if err != nil {
 		log.L().Error("marshal to json", zap.Reflect("master config", c), log.ShortError(err))
@@ -136,7 +144,7 @@ func (c *Config) String() string {
 	return string(cfg)
 }
 
-// Toml returns TOML format representation of config
+// Toml returns TOML format representation of config.
 func (c *Config) Toml() (string, error) {
 	var b bytes.Buffer
 
@@ -213,7 +221,7 @@ func (c *Config) configFromFile(path string) error {
 	return nil
 }
 
-// adjust adjusts configs
+// adjust adjusts configs.
 func (c *Config) adjust() error {
 	c.MasterAddr = utils.UnwrapScheme(c.MasterAddr)
 	// MasterAddr's format may be "host:port" or ":port"
@@ -301,10 +309,17 @@ func (c *Config) adjust() error {
 		c.Join = utils.WrapSchemes(c.Join, c.SSLCA != "")
 	}
 
+	if c.QuotaBackendBytes < quotaBackendBytesLowerBound {
+		log.L().Warn("quota-backend-bytes is too low, will adjust it",
+			zap.Int64("from", c.QuotaBackendBytes),
+			zap.Int64("to", quotaBackendBytesLowerBound))
+		c.QuotaBackendBytes = quotaBackendBytesLowerBound
+	}
+
 	return err
 }
 
-// Reload load config from local file
+// Reload load config from local file.
 func (c *Config) Reload() error {
 	if c.ConfigFile != "" {
 		err := c.configFromFile(c.ConfigFile)
@@ -345,6 +360,9 @@ func (c *Config) genEmbedEtcdConfig(cfg *embed.Config) (*embed.Config, error) {
 
 	cfg.InitialCluster = c.InitialCluster
 	cfg.ClusterState = c.InitialClusterState
+	cfg.AutoCompactionMode = c.AutoCompactionMode
+	cfg.AutoCompactionRetention = c.AutoCompactionRetention
+	cfg.QuotaBackendBytes = c.QuotaBackendBytes
 
 	err = cfg.Validate() // verify & trigger the builder
 	if err != nil {
@@ -387,7 +405,7 @@ func parseURLs(s string) ([]url.URL, error) {
 		// tolerate valid `master-addr`, but invalid URL format. mainly caused by no protocol scheme
 		if !(strings.HasPrefix(item, "http://") || strings.HasPrefix(item, "https://")) {
 			prefix := "http://"
-			if atomic.LoadInt32(&useTLS) == 1 {
+			if useTLS.Load() {
 				prefix = "https://"
 			}
 			item = prefix + item
@@ -408,7 +426,7 @@ func genEmbedEtcdConfigWithLogger(logLevel string) *embed.Config {
 	cfg := embed.NewConfig()
 	// disable grpc gateway because https://github.com/etcd-io/etcd/issues/12713
 	// TODO: wait above issue fixed
-	//cfg.EnableGRPCGateway = true // enable gRPC gateway for the internal etcd.
+	// cfg.EnableGRPCGateway = true // enable gRPC gateway for the internal etcd.
 
 	// use zap as the logger for embed etcd
 	// NOTE: `genEmbedEtcdConfig` can only be called after logger initialized.

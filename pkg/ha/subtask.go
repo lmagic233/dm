@@ -24,21 +24,10 @@ import (
 	"github.com/pingcap/dm/pkg/terror"
 )
 
-// PutSubTaskCfg puts the subtask configs of the specified source and task name into etcd.
-// k/k/v: sourceID, taskName -> subtask config.
-func PutSubTaskCfg(cli *clientv3.Client, cfgs ...config.SubTaskConfig) (int64, error) {
-	ops, err := putSubTaskCfgOp(cfgs...)
-	if err != nil {
-		return 0, err
-	}
-	_, rev, err := etcdutil.DoOpsInOneTxnWithRetry(cli, ops...)
-	return rev, err
-}
-
 // GetSubTaskCfg gets the subtask config of the specified source and task name.
 // if the config for the source not exist, return with `err == nil` and `revision=0`.
 // if task name is "", will return all the subtaskConfigs as a map{taskName: subtaskConfig} of the source
-// if task name if given, will return a map{taskName: subtaskConfig} whose length is 1
+// if task name if given, will return a map{taskName: subtaskConfig} whose length is 1.
 func GetSubTaskCfg(cli *clientv3.Client, source, task string, rev int64) (map[string]config.SubTaskConfig, int64, error) {
 	ctx, cancel := context.WithTimeout(cli.Ctx(), etcdutil.DefaultRequestTimeout)
 	defer cancel()
@@ -68,13 +57,12 @@ func GetSubTaskCfg(cli *clientv3.Client, source, task string, rev int64) (map[st
 }
 
 // GetAllSubTaskCfg gets all subtask configs.
-// k/v: source ID -> task name -> subtask config
+// k/v: source ID -> task name -> subtask config.
 func GetAllSubTaskCfg(cli *clientv3.Client) (map[string]map[string]config.SubTaskConfig, int64, error) {
 	ctx, cancel := context.WithTimeout(cli.Ctx(), etcdutil.DefaultRequestTimeout)
 	defer cancel()
 
 	resp, err := cli.Get(ctx, common.UpstreamSubTaskKeyAdapter.Path(), clientv3.WithPrefix())
-
 	if err != nil {
 		return nil, 0, err
 	}

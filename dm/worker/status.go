@@ -14,7 +14,6 @@
 package worker
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -23,19 +22,20 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/dm/pb"
+	"github.com/pingcap/dm/syncer"
 )
 
-// Status returns the status of the current sub task
-func (st *SubTask) Status(ctx context.Context) interface{} {
+// Status returns the status of the current sub task.
+func (st *SubTask) Status() interface{} {
 	if cu := st.CurrUnit(); cu != nil {
-		return cu.Status(ctx)
+		return cu.Status()
 	}
 	return nil
 }
 
-// StatusJSON returns the status of the current sub task as json string
-func (st *SubTask) StatusJSON(ctx context.Context) string {
-	status := st.Status(ctx)
+// StatusJSON returns the status of the current sub task as json string.
+func (st *SubTask) StatusJSON() string {
+	status := st.Status()
 	sj, err := json.Marshal(status)
 	if err != nil {
 		st.l.Error("fail to marshal status", zap.Reflect("status", status), zap.Error(err))
@@ -45,9 +45,8 @@ func (st *SubTask) StatusJSON(ctx context.Context) string {
 }
 
 // Status returns the status of the worker (and sub tasks)
-// if stName is empty, all sub task's status will be returned
-func (w *Worker) Status(ctx context.Context, stName string) []*pb.SubTaskStatus {
-
+// if stName is empty, all sub task's status will be returned.
+func (w *Worker) Status(stName string) []*pb.SubTaskStatus {
 	sts := w.subTaskHolder.getAllSubTasks()
 
 	if len(sts) == 0 {
@@ -76,7 +75,7 @@ func (w *Worker) Status(ctx context.Context, stName string) []*pb.SubTaskStatus 
 				Status: &pb.SubTaskStatus_Msg{Msg: fmt.Sprintf("no sub task with name %s has started", name)},
 			}
 		} else {
-			var lockID = ""
+			lockID := ""
 			op := st.ShardDDLOperation()
 			if op != nil {
 				lockID = op.ID
@@ -93,7 +92,7 @@ func (w *Worker) Status(ctx context.Context, stName string) []*pb.SubTaskStatus 
 			if cu != nil {
 				stStatus.Unit = cu.Type()
 				// oneof status
-				us := cu.Status(ctx)
+				us := cu.Status()
 				switch stStatus.Unit {
 				case pb.UnitType_Check:
 					stStatus.Status = &pb.SubTaskStatus_Check{Check: us.(*pb.CheckStatus)}
@@ -102,7 +101,10 @@ func (w *Worker) Status(ctx context.Context, stName string) []*pb.SubTaskStatus 
 				case pb.UnitType_Load:
 					stStatus.Status = &pb.SubTaskStatus_Load{Load: us.(*pb.LoadStatus)}
 				case pb.UnitType_Sync:
-					stStatus.Status = &pb.SubTaskStatus_Sync{Sync: us.(*pb.SyncStatus)}
+					cus := cu.(*syncer.Syncer) // ss must be *syncer.Syncer
+					ss := us.(*pb.SyncStatus)
+					ss.SecondsBehindMaster = cus.GetSecondsBehindMaster()
+					stStatus.Status = &pb.SubTaskStatus_Sync{Sync: ss}
 				}
 			}
 		}
@@ -112,9 +114,9 @@ func (w *Worker) Status(ctx context.Context, stName string) []*pb.SubTaskStatus 
 	return status
 }
 
-// StatusJSON returns the status of the worker as json string
-func (w *Worker) StatusJSON(ctx context.Context, stName string) string {
-	sl := &pb.SubTaskStatusList{Status: w.Status(ctx, stName)}
+// StatusJSON returns the status of the worker as json string.
+func (w *Worker) StatusJSON(stName string) string {
+	sl := &pb.SubTaskStatusList{Status: w.Status(stName)}
 	mar := jsonpb.Marshaler{EmitDefaults: true, Indent: "    "}
 	s, err := mar.MarshalToString(sl)
 	if err != nil {

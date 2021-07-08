@@ -1,7 +1,3 @@
-import_v10x
-tls
-sharding2
-ha
 full_mode
 dm_syncer
 sequence_sharding_optimistic
@@ -9,3 +5,7 @@ sequence_sharding_removemeta
 drop_column_with_index
 gtid
 only_dml
+adjust_gtid
+load_task
+downstream_more_column
+expression_filter

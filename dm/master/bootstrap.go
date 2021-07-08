@@ -56,18 +56,28 @@ func (s *Server) bootstrap(ctx context.Context) error {
 		if err != nil {
 			return terror.ErrMasterFailToImportFromV10x.Delegate(err)
 		}
+	} else {
+		uctx := upgrade.Context{
+			Context:        ctx,
+			SubTaskConfigs: s.scheduler.GetSubTaskCfgs(),
+		}
+		err := upgrade.TryUpgrade(s.etcdClient, uctx)
+		if err != nil {
+			return err
+		}
 	}
-
-	uctx := upgrade.Context{
-		Context:        ctx,
-		SubTaskConfigs: s.scheduler.GetSubTaskCfgs(),
-	}
-	err := upgrade.TryUpgrade(s.etcdClient, uctx)
-
-	if err != nil {
-		return err
-	}
+	log.L().Info("successful bootstrapped")
 	return nil
+}
+
+func (s *Server) bootstrapBeforeSchedulerStart(ctx context.Context) error {
+	log.L().Info("bootstrap before scheduler start")
+	// no need for v1.0.x
+	if s.cfg.V1SourcesPath != "" {
+		return nil
+	}
+
+	return upgrade.TryUpgradeBeforeSchedulerStart(ctx, s.etcdClient)
 }
 
 // importFromV10x tries to import/upgrade the cluster from v1.0.x.
@@ -104,16 +114,26 @@ func (s *Server) importFromV10x(ctx context.Context) error {
 		return err
 	}
 
-	// 5. create sources.
-	logger.Info("add source config into cluster")
-	err = s.addSourcesV1Import(tctx, sourceCfgs)
+	// 5. upgrade v1.0.x downstream metadata table and run v2.0 upgrading routines.
+	//    some v2.0 upgrading routines are also altering schema, if we run them after adding sources, DM worker will
+	//    meet error.
+	logger.Info("upgrading downstream metadata tables")
+	err = s.upgradeDBSchemaV1Import(tctx, subtaskCfgs)
+	if err != nil {
+		return err
+	}
+	uctx := upgrade.Context{
+		Context:        ctx,
+		SubTaskConfigs: subtaskCfgs,
+	}
+	err = upgrade.UntouchVersionUpgrade(s.etcdClient, uctx)
 	if err != nil {
 		return err
 	}
 
-	// 6. upgrade v1.0.x downstream metadata table.
-	logger.Info("upgrading downstream metadata tables")
-	err = s.upgradeDBSchemaV1Import(tctx, subtaskCfgs)
+	// 6. create sources.
+	logger.Info("add source config into cluster")
+	err = s.addSourcesV1Import(tctx, sourceCfgs)
 	if err != nil {
 		return err
 	}
@@ -127,7 +147,7 @@ func (s *Server) importFromV10x(ctx context.Context) error {
 
 	// 8. mark the upgrade operation as done.
 	logger.Info("marking upgrade from v1.0.x as done")
-	_, err = upgrade.PutVersion(s.etcdClient, upgrade.MinVersion)
+	_, err = upgrade.PutVersion(s.etcdClient, upgrade.CurrentVersion)
 	if err != nil {
 		return err
 	}
@@ -142,13 +162,13 @@ func (s *Server) importFromV10x(ctx context.Context) error {
 }
 
 // collectSourceConfigFilesV1Import tries to collect source config files for v1.0.x importing.
-func (s *Server) collectSourceConfigFilesV1Import(tctx *tcontext.Context) (map[string]config.SourceConfig, error) {
+func (s *Server) collectSourceConfigFilesV1Import(tctx *tcontext.Context) (map[string]*config.SourceConfig, error) {
 	files, err := ioutil.ReadDir(s.cfg.V1SourcesPath)
 	if err != nil {
 		return nil, err
 	}
 
-	cfgs := make(map[string]config.SourceConfig)
+	cfgs := make(map[string]*config.SourceConfig)
 	for _, f := range files {
 		if f.IsDir() {
 			continue // ignore sub directories.
@@ -166,7 +186,7 @@ func (s *Server) collectSourceConfigFilesV1Import(tctx *tcontext.Context) (map[s
 			return nil, err
 		}
 
-		cfgs[cfgs2[0].SourceID] = *cfgs2[0]
+		cfgs[cfgs2[0].SourceID] = cfgs2[0]
 		tctx.Logger.Info("collected source config", zap.Stringer("config", cfgs2[0]))
 	}
 
@@ -175,7 +195,7 @@ func (s *Server) collectSourceConfigFilesV1Import(tctx *tcontext.Context) (map[s
 
 // waitWorkersReadyV1Import waits for DM-worker instances ready for v1.0.x importing.
 // NOTE: in v1.0.x, `count of DM-worker instances` equals `count of source config files`.
-func (s *Server) waitWorkersReadyV1Import(tctx *tcontext.Context, sourceCfgs map[string]config.SourceConfig) error {
+func (s *Server) waitWorkersReadyV1Import(tctx *tcontext.Context, sourceCfgs map[string]*config.SourceConfig) error {
 	// now, we simply check count repeatedly.
 	count := len(sourceCfgs)
 	ctx2, cancel2 := context.WithTimeout(context.Background(), waitWorkerV1Timeout)
@@ -271,7 +291,7 @@ func (s *Server) getSubtaskCfgsStagesV1Import(tctx *tcontext.Context) (
 }
 
 // addSourcesV1Import tries to add source config into the cluster for v1.0.x importing.
-func (s *Server) addSourcesV1Import(tctx *tcontext.Context, cfgs map[string]config.SourceConfig) error {
+func (s *Server) addSourcesV1Import(tctx *tcontext.Context, cfgs map[string]*config.SourceConfig) error {
 	var (
 		added []string
 		err   error

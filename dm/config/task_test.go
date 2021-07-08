@@ -20,21 +20,21 @@ import (
 	"strings"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/dm/pkg/terror"
 	bf "github.com/pingcap/tidb-tools/pkg/binlog-filter"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	router "github.com/pingcap/tidb-tools/pkg/table-router"
+
+	"github.com/pingcap/dm/pkg/terror"
 
 	"github.com/coreos/go-semver/semver"
 )
 
 func (t *testConfig) TestUnusedTaskConfig(c *C) {
-	var correctTaskConfig = `---
+	correctTaskConfig := `---
 name: test
 task-mode: all
 shard-mode: "pessimistic"       
 meta-schema: "dm_meta"         
-timezone: "Asia/Shanghai"     
 case-sensitive: false        
 online-ddl-scheme: "gh-ost" 
 clean-dump-file: true     
@@ -111,6 +111,12 @@ syncers:
     enable-ansi-quotes: true
     safe-mode: false  
 
+expression-filter:
+  expr-1:
+    schema: "db"
+    table: "tbl"
+    insert-value-expr: "a > 1"
+
 mysql-instances:
   - source-id: "mysql-replica-01"
     route-rules: ["route-rule-2"]
@@ -119,6 +125,7 @@ mysql-instances:
     mydumper-config-name: "global1"
     loader-config-name: "global1"
     syncer-config-name: "global1"
+    expression-filters: ["expr-1"]
 
   - source-id: "mysql-replica-02"
     route-rules: ["route-rule-1"]
@@ -131,12 +138,11 @@ mysql-instances:
 	taskConfig := NewTaskConfig()
 	err := taskConfig.Decode(correctTaskConfig)
 	c.Assert(err, IsNil)
-	var errorTaskConfig = `---
+	errorTaskConfig := `---
 name: test
 task-mode: all
 shard-mode: "pessimistic"       
 meta-schema: "dm_meta"         
-timezone: "Asia/Shanghai"     
 case-sensitive: false        
 online-ddl-scheme: "gh-ost" 
 clean-dump-file: true     
@@ -213,6 +219,12 @@ syncers:
     batch: 100 
     enable-ansi-quotes: true
     safe-mode: false  
+
+expression-filter:
+  expr-1:
+    schema: "db"
+    table: "tbl"
+    insert-value-expr: "a > 1"
 
 mysql-instances:
   - source-id: "mysql-replica-01"
@@ -234,17 +246,17 @@ mysql-instances:
 	taskConfig = NewTaskConfig()
 	err = taskConfig.Decode(errorTaskConfig)
 	c.Check(err, NotNil)
-	c.Assert(err, ErrorMatches, `[\s\S]*The configurations as following \[column-mapping-rule-2 filter-rule-2 route-rule-2\] are set in global configuration[\s\S]*`)
+	c.Assert(err, ErrorMatches, `[\s\S]*The configurations as following \[column-mapping-rule-2 expr-1 filter-rule-2 route-rule-2\] are set in global configuration[\s\S]*`)
 }
 
 func (t *testConfig) TestInvalidTaskConfig(c *C) {
-	var errorTaskConfig1 = `---
+	errorTaskConfig1 := `---
 name: test
 task-mode: all
 is-sharding: true
 meta-schema: "dm_meta"
-enable-heartbeat: true
 timezone: "Asia/Shanghai"
+enable-heartbeat: true
 ignore-checking-items: ["all"]
 
 target-database:
@@ -263,7 +275,7 @@ mysql-instances:
     loader-config-name: "global"
     syncer-config-name: "global"
 `
-	var errorTaskConfig2 = `---
+	errorTaskConfig2 := `---
 name: test
 name: test1
 task-mode: all
@@ -307,10 +319,9 @@ task-mode: all
 is-sharding: true
 meta-schema: "dm_meta"
 enable-heartbeat: true
-timezone: "Asia/Shanghai"
 ignore-checking-items: ["all"]
 `)
-	err = ioutil.WriteFile(filepath, configContent, 0644)
+	err = ioutil.WriteFile(filepath, configContent, 0o644)
 	c.Assert(err, IsNil)
 	taskConfig = NewTaskConfig()
 	err = taskConfig.DecodeFile(filepath)
@@ -324,10 +335,9 @@ task-mode: all
 is-sharding: true
 meta-schema: "dm_meta"
 enable-heartbeat: true
-timezone: "Asia/Shanghai"
 ignore-checking-items: ["all"]
 `)
-	err = ioutil.WriteFile(filepath, configContent, 0644)
+	err = ioutil.WriteFile(filepath, configContent, 0o644)
 	c.Assert(err, IsNil)
 	taskConfig = NewTaskConfig()
 	err = taskConfig.DecodeFile(filepath)
@@ -339,10 +349,9 @@ name: test
 is-sharding: true
 meta-schema: "dm_meta"
 enable-heartbeat: true
-timezone: "Asia/Shanghai"
 ignore-checking-items: ["all"]
 `)
-	err = ioutil.WriteFile(filepath, configContent, 0644)
+	err = ioutil.WriteFile(filepath, configContent, 0o644)
 	c.Assert(err, IsNil)
 	taskConfig = NewTaskConfig()
 	err = taskConfig.DecodeFile(filepath)
@@ -357,7 +366,6 @@ meta-schema: "dm_meta"
 enable-heartbeat: true
 heartbeat-update-interval: 1
 heartbeat-report-interval: 1
-timezone: "Asia/Shanghai"
 
 target-database:
   host: "127.0.0.1"
@@ -409,7 +417,7 @@ syncers:
     batch: 100
 `)
 
-	err = ioutil.WriteFile(filepath, configContent, 0644)
+	err = ioutil.WriteFile(filepath, configContent, 0o644)
 	c.Assert(err, IsNil)
 	taskConfig = NewTaskConfig()
 	err = taskConfig.DecodeFile(filepath)
@@ -435,7 +443,6 @@ meta-schema: "dm_meta"
 enable-heartbeat: true
 heartbeat-update-interval: 1
 heartbeat-report-interval: 1
-timezone: "Asia/Shanghai"
 
 target-database:
   host: "127.0.0.1"
@@ -465,7 +472,7 @@ filters:
   filter-rule-4:
 `)
 
-	err = ioutil.WriteFile(filepath, configContent, 0644)
+	err = ioutil.WriteFile(filepath, configContent, 0o644)
 	c.Assert(err, IsNil)
 	taskConfig = NewTaskConfig()
 	err = taskConfig.DecodeFile(filepath)
@@ -478,7 +485,6 @@ filters:
 	c.Assert(terror.ErrConfigDuplicateCfgItem.Equal(err), IsTrue)
 	c.Assert(err, ErrorMatches, `[\s\S]*mysql-instance\(0\)'s route-rules: route-rule-1, route-rule-2[\s\S]*`)
 	c.Assert(err, ErrorMatches, `[\s\S]*mysql-instance\(1\)'s filter-rules: filter-rule-2[\s\S]*`)
-
 }
 
 func (t *testConfig) TestCheckDuplicateString(c *C) {
@@ -543,13 +549,14 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 		metaSchema          = "meta-sub-tasks"
 		heartbeatUI         = 12
 		heartbeatRI         = 21
-		timezone            = "Asia/Shanghai"
 		maxAllowedPacket    = 10244201
 		fromSession         = map[string]string{
-			"sql_mode": " NO_AUTO_VALUE_ON_ZERO,ANSI_QUOTES",
+			"sql_mode":  " NO_AUTO_VALUE_ON_ZERO,ANSI_QUOTES",
+			"time_zone": "+00:00",
 		}
 		toSession = map[string]string{
-			"sql_mode": " NO_AUTO_VALUE_ON_ZERO,ANSI_QUOTES",
+			"sql_mode":  " NO_AUTO_VALUE_ON_ZERO,ANSI_QUOTES",
+			"time_zone": "+00:00",
 		}
 		security = Security{
 			SSLCA:         "/path/to/ca",
@@ -564,7 +571,7 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 		}
 		routeRule1 = router.TableRule{
 			SchemaPattern: "db*",
-			TablePattern:  "tbl*",
+			TargetSchema:  "db",
 		}
 		routeRule2 = router.TableRule{
 			SchemaPattern: "db*",
@@ -573,8 +580,8 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 			TargetTable:   "tbl",
 		}
 		routeRule3 = router.TableRule{
-			SchemaPattern: "database*",
-			TablePattern:  "table*",
+			SchemaPattern: "schema*",
+			TargetSchema:  "schema",
 		}
 		routeRule4 = router.TableRule{
 			SchemaPattern: "schema*",
@@ -608,6 +615,11 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 				{Schema: "bd1", Name: "lbt1"},
 				{Schema: "bd2", Name: "lbt2"},
 			},
+		}
+		exprFilter1 = ExpressionFilter{
+			Schema:          "db",
+			Table:           "tbl",
+			DeleteValueExpr: "state = 1",
 		}
 		source1DBCfg = DBConfig{
 			Host:             "127.0.0.1",
@@ -648,8 +660,7 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 				BinLogPos:  456,
 				BinLogGTID: "1-1-12,4-4-4",
 			},
-			Timezone: timezone,
-			From:     source1DBCfg,
+			From: source1DBCfg,
 			To: DBConfig{
 				Host:             "127.0.0.1",
 				Port:             4000,
@@ -704,6 +715,7 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 	stCfg2.From = source2DBCfg
 	stCfg2.BAList = &baList2
 	stCfg2.RouteRules = []*router.TableRule{&routeRule4, &routeRule1, &routeRule2}
+	stCfg2.ExprFilter = []*ExpressionFilter{&exprFilter1}
 
 	cfg := FromSubTaskConfigs(stCfg1, stCfg2)
 
@@ -717,7 +729,6 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 		EnableHeartbeat:         stCfg1.EnableHeartbeat,
 		HeartbeatUpdateInterval: heartbeatUI,
 		HeartbeatReportInterval: heartbeatRI,
-		Timezone:                timezone,
 		CaseSensitive:           stCfg1.CaseSensitive,
 		TargetDB:                &stCfg1.To,
 		MySQLInstances: []*MySQLInstance{
@@ -756,6 +767,7 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 				SyncerConfigName:   "sync-01",
 				Syncer:             nil,
 				SyncerThread:       0,
+				ExpressionFilters:  []string{"expr-filter-01"},
 			},
 		},
 		OnlineDDLScheme: onlineDDLScheme,
@@ -784,6 +796,9 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 		Syncers: map[string]*SyncerConfig{
 			"sync-01": &stCfg1.SyncerConfig,
 		},
+		ExprFilter: map[string]*ExpressionFilter{
+			"expr-filter-01": &exprFilter1,
+		},
 		CleanDumpFile: stCfg1.CleanDumpFile,
 	}
 
@@ -800,8 +815,11 @@ func (t *testConfig) TestGenAndFromSubTaskConfigs(c *C) {
 	c.Assert(stCfg1.ColumnMappingRules, HasLen, 0)
 	c.Assert(stCfgs[1].ColumnMappingRules, HasLen, 0)
 	c.Assert(stCfg2.ColumnMappingRules, HasLen, 0)
+	c.Assert(stCfgs[0].ExprFilter, HasLen, 0)
+	c.Assert(stCfg1.ExprFilter, HasLen, 0)
 	stCfgs[0].ColumnMappingRules = stCfg1.ColumnMappingRules
 	stCfgs[1].ColumnMappingRules = stCfg2.ColumnMappingRules
+	stCfgs[0].ExprFilter = stCfg1.ExprFilter
 	// deprecated config will not recover
 	stCfgs[0].EnableANSIQuotes = stCfg1.EnableANSIQuotes
 	stCfgs[1].EnableANSIQuotes = stCfg2.EnableANSIQuotes
@@ -851,6 +869,7 @@ func (t *testConfig) TestMetaVerify(c *C) {
 
 func (t *testConfig) TestMySQLInstance(c *C) {
 	var m *MySQLInstance
+	cfgName := "test"
 	err := m.VerifyAndAdjust()
 	c.Assert(terror.ErrConfigMySQLInstNotFound.Equal(err), IsTrue)
 
@@ -860,25 +879,24 @@ func (t *testConfig) TestMySQLInstance(c *C) {
 	m.SourceID = "123"
 
 	m.Mydumper = &MydumperConfig{}
-	m.MydumperConfigName = "test"
+	m.MydumperConfigName = cfgName
 	err = m.VerifyAndAdjust()
 	c.Assert(terror.ErrConfigMydumperCfgConflict.Equal(err), IsTrue)
 	m.MydumperConfigName = ""
 
 	m.Loader = &LoaderConfig{}
-	m.LoaderConfigName = "test"
+	m.LoaderConfigName = cfgName
 	err = m.VerifyAndAdjust()
 	c.Assert(terror.ErrConfigLoaderCfgConflict.Equal(err), IsTrue)
 	m.Loader = nil
 
 	m.Syncer = &SyncerConfig{}
-	m.SyncerConfigName = "test"
+	m.SyncerConfigName = cfgName
 	err = m.VerifyAndAdjust()
 	c.Assert(terror.ErrConfigSyncerCfgConflict.Equal(err), IsTrue)
 	m.SyncerConfigName = ""
 
 	c.Assert(m.VerifyAndAdjust(), IsNil)
-
 }
 
 func (t *testConfig) TestAdjustTargetDBConfig(c *C) {
@@ -889,22 +907,22 @@ func (t *testConfig) TestAdjustTargetDBConfig(c *C) {
 	}{
 		{
 			DBConfig{},
-			DBConfig{Session: map[string]string{}},
+			DBConfig{Session: map[string]string{"time_zone": "+00:00"}},
 			semver.New("0.0.0"),
 		},
 		{
 			DBConfig{Session: map[string]string{"SQL_MODE": "ANSI_QUOTES"}},
-			DBConfig{Session: map[string]string{"sql_mode": "ANSI_QUOTES"}},
+			DBConfig{Session: map[string]string{"sql_mode": "ANSI_QUOTES", "time_zone": "+00:00"}},
 			semver.New("2.0.7"),
 		},
 		{
 			DBConfig{},
-			DBConfig{Session: map[string]string{tidbTxnMode: tidbTxnOptimistic}},
+			DBConfig{Session: map[string]string{tidbTxnMode: tidbTxnOptimistic, "time_zone": "+00:00"}},
 			semver.New("3.0.1"),
 		},
 		{
 			DBConfig{Session: map[string]string{"SQL_MODE": "", tidbTxnMode: "pessimistic"}},
-			DBConfig{Session: map[string]string{"sql_mode": "", tidbTxnMode: "pessimistic"}},
+			DBConfig{Session: map[string]string{"sql_mode": "", tidbTxnMode: "pessimistic", "time_zone": "+00:00"}},
 			semver.New("4.0.0-beta.2"),
 		},
 	}
@@ -927,4 +945,69 @@ func (t *testConfig) TestDefaultConfig(c *C) {
 	cfg.MySQLInstances[0].Mydumper = &MydumperConfig{MydumperPath: "test"}
 	c.Assert(cfg.adjust(), IsNil)
 	c.Assert(cfg.MySQLInstances[0].Mydumper.ChunkFilesize, Equals, defaultChunkFilesize)
+}
+
+func (t *testConfig) TestExclusiveAndWrongExprFilterFields(c *C) {
+	cfg := NewTaskConfig()
+	cfg.Name = "test"
+	cfg.TaskMode = "all"
+	cfg.TargetDB = &DBConfig{}
+	cfg.MySQLInstances = append(cfg.MySQLInstances, &MySQLInstance{SourceID: "source1"})
+	c.Assert(cfg.adjust(), IsNil)
+
+	cfg.ExprFilter["test-insert"] = &ExpressionFilter{
+		Schema:          "db",
+		Table:           "tbl",
+		InsertValueExpr: "a > 1",
+	}
+	cfg.ExprFilter["test-update-only-old"] = &ExpressionFilter{
+		Schema:             "db",
+		Table:              "tbl",
+		UpdateOldValueExpr: "a > 1",
+	}
+	cfg.ExprFilter["test-update-only-new"] = &ExpressionFilter{
+		Schema:             "db",
+		Table:              "tbl",
+		UpdateNewValueExpr: "a > 1",
+	}
+	cfg.ExprFilter["test-update"] = &ExpressionFilter{
+		Schema:             "db",
+		Table:              "tbl",
+		UpdateOldValueExpr: "a > 1",
+		UpdateNewValueExpr: "a > 1",
+	}
+	cfg.ExprFilter["test-delete"] = &ExpressionFilter{
+		Schema:          "db",
+		Table:           "tbl",
+		DeleteValueExpr: "a > 1",
+	}
+	cfg.MySQLInstances[0].ExpressionFilters = []string{
+		"test-insert",
+		"test-update-only-old",
+		"test-update-only-new",
+		"test-update",
+		"test-delete",
+	}
+	c.Assert(cfg.adjust(), IsNil)
+
+	cfg.ExprFilter["both-field"] = &ExpressionFilter{
+		Schema:          "db",
+		Table:           "tbl",
+		InsertValueExpr: "a > 1",
+		DeleteValueExpr: "a > 1",
+	}
+	cfg.MySQLInstances[0].ExpressionFilters = append(cfg.MySQLInstances[0].ExpressionFilters, "both-field")
+	err := cfg.adjust()
+	c.Assert(terror.ErrConfigExprFilterManyExpr.Equal(err), IsTrue)
+
+	delete(cfg.ExprFilter, "both-field")
+	cfg.ExprFilter["wrong"] = &ExpressionFilter{
+		Schema:          "db",
+		Table:           "tbl",
+		DeleteValueExpr: "a >",
+	}
+	length := len(cfg.MySQLInstances[0].ExpressionFilters)
+	cfg.MySQLInstances[0].ExpressionFilters[length-1] = "wrong"
+	err = cfg.adjust()
+	c.Assert(terror.ErrConfigExprFilterWrongGrammar.Equal(err), IsTrue)
 }

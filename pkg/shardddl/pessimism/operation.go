@@ -17,12 +17,12 @@ import (
 	"context"
 	"encoding/json"
 
-	"github.com/pingcap/dm/dm/common"
-	"github.com/pingcap/dm/pkg/etcdutil"
-
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/clientv3/clientv3util"
 	"go.etcd.io/etcd/mvcc/mvccpb"
+
+	"github.com/pingcap/dm/dm/common"
+	"github.com/pingcap/dm/pkg/etcdutil"
 )
 
 // Operation represents a shard DDL coordinate operation.
@@ -42,12 +42,12 @@ type Operation struct {
 }
 
 // NewOperation creates a new Operation instance.
-func NewOperation(ID, task, source string, DDLs []string, exec, done bool) Operation {
+func NewOperation(id, task, source string, ddls []string, exec, done bool) Operation {
 	return Operation{
-		ID:     ID,
+		ID:     id,
 		Task:   task,
 		Source: source,
-		DDLs:   DDLs,
+		DDLs:   ddls,
 		Exec:   exec,
 		Done:   done,
 	}
@@ -174,7 +174,6 @@ func GetInfosOperationsByTask(cli *clientv3.Client, task string) ([]Info, []Oper
 	respTxn, _, err := etcdutil.DoOpsInOneTxnWithRetry(cli,
 		clientv3.OpGet(common.ShardDDLPessimismInfoKeyAdapter.Encode(task), clientv3.WithPrefix()),
 		clientv3.OpGet(common.ShardDDLPessimismOperationKeyAdapter.Encode(task), clientv3.WithPrefix()))
-
 	if err != nil {
 		return nil, nil, 0, err
 	}
@@ -220,8 +219,15 @@ func WatchOperationDelete(ctx context.Context, cli *clientv3.Client, task, sourc
 func watchOperation(ctx context.Context, cli *clientv3.Client, watchType mvccpb.Event_EventType,
 	task, source string, revision int64,
 	outCh chan<- Operation, errCh chan<- error) {
-	ch := cli.Watch(ctx, common.ShardDDLPessimismOperationKeyAdapter.Encode(task, source),
-		clientv3.WithPrefix(), clientv3.WithRev(revision), clientv3.WithPrevKV())
+	var ch clientv3.WatchChan
+	// caller may use empty keys to expect a prefix watch
+	if source == "" {
+		ch = cli.Watch(ctx, common.ShardDDLPessimismOperationKeyAdapter.Path(), clientv3.WithPrefix(),
+			clientv3.WithRev(revision), clientv3.WithPrevKV())
+	} else {
+		ch = cli.Watch(ctx, common.ShardDDLPessimismOperationKeyAdapter.Encode(task, source),
+			clientv3.WithRev(revision), clientv3.WithPrevKV())
+	}
 
 	for {
 		select {

@@ -17,8 +17,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
 	. "github.com/pingcap/check"
@@ -35,9 +37,7 @@ func Test(t *testing.T) {
 
 var _ = Suite(&trackerSuite{})
 
-var (
-	defaultTestSessionCfg = map[string]string{"sql_mode": "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"}
-)
+var defaultTestSessionCfg = map[string]string{"sql_mode": "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_AUTO_CREATE_USER,NO_ENGINE_SUBSTITUTION"}
 
 type trackerSuite struct {
 	baseConn   *conn.BaseConn
@@ -46,8 +46,8 @@ type trackerSuite struct {
 }
 
 func (s *trackerSuite) SetUpSuite(c *C) {
-	s.backupKeys = sessionVars
-	sessionVars = []string{"sql_mode"}
+	s.backupKeys = downstreamVars
+	downstreamVars = []string{"sql_mode"}
 	db, _, err := sqlmock.New()
 	s.db = db
 	c.Assert(err, IsNil)
@@ -58,7 +58,7 @@ func (s *trackerSuite) SetUpSuite(c *C) {
 
 func (s *trackerSuite) TearDownSuite(c *C) {
 	s.db.Close()
-	sessionVars = s.backupKeys
+	downstreamVars = s.backupKeys
 }
 
 func (s *trackerSuite) TestTiDBAndSessionCfg(c *C) {
@@ -144,6 +144,23 @@ func (s *trackerSuite) TestTiDBAndSessionCfg(c *C) {
 	// test alter primary key
 	err = tracker.Exec(ctx, "testdb", "alter table \"foo\" drop primary key")
 	c.Assert(err, IsNil)
+
+	// test user could specify tidb_enable_clustered_index in config
+	sessionCfg = map[string]string{
+		"sql_mode":                    "NO_ZERO_DATE,NO_ZERO_IN_DATE,ANSI_QUOTES",
+		"tidb_enable_clustered_index": "ON",
+	}
+	tracker, err = NewTracker(context.Background(), "test-tracker", sessionCfg, baseConn)
+	c.Assert(err, IsNil)
+	c.Assert(mock.ExpectationsWereMet(), IsNil)
+
+	err = tracker.Exec(ctx, "", "create database testdb;")
+	c.Assert(err, IsNil)
+	err = tracker.Exec(ctx, "testdb", "create table \"foo\" (a varchar(255) primary key)")
+	c.Assert(err, IsNil)
+	cts, err = tracker.GetCreateTable(context.Background(), "testdb", "foo")
+	c.Assert(err, IsNil)
+	c.Assert(cts, Equals, "CREATE TABLE \"foo\" ( \"a\" varchar(255) NOT NULL, PRIMARY KEY (\"a\") /*T![clustered_index] CLUSTERED */) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin")
 }
 
 func (s *trackerSuite) TestDDL(c *C) {
@@ -210,7 +227,6 @@ func (s *trackerSuite) TestDDL(c *C) {
 	cts, err = tracker.GetCreateTable(context.Background(), "testdb", "foo")
 	c.Assert(err, IsNil)
 	c.Assert(cts, Equals, "CREATE TABLE `foo` ( `a` varchar(255) NOT NULL, `c` int(11) DEFAULT NULL, PRIMARY KEY (`a`) /*T![clustered_index] NONCLUSTERED */) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin")
-
 }
 
 func (s *trackerSuite) TestGetSingleColumnIndices(c *C) {
@@ -375,6 +391,14 @@ func (s *trackerSuite) TestCreateTableIfNotExists(c *C) {
 	clearVolatileInfo(ti2)
 	c.Assert(ti2, DeepEquals, ti1, Commentf("ti2 = %s\nti1 = %s", asJSON{ti2}, asJSON{ti1}))
 
+	// no error if table already exist
+	err = tracker.CreateTableIfNotExists("testdb", "foo", ti1)
+	c.Assert(err, IsNil)
+
+	// error if db not exist
+	err = tracker.CreateTableIfNotExists("test-another-db", "foo", ti1)
+	c.Assert(err, ErrorMatches, ".*Unknown database.*")
+
 	// Can use the table info to recover a table using a different name.
 	err = tracker.CreateTableIfNotExists("testdb", "bar", ti1)
 	c.Assert(err, IsNil)
@@ -385,6 +409,14 @@ func (s *trackerSuite) TestCreateTableIfNotExists(c *C) {
 	clearVolatileInfo(ti3)
 	ti3.Name = ti1.Name
 	c.Assert(ti3, DeepEquals, ti1, Commentf("ti3 = %s\nti1 = %s", asJSON{ti3}, asJSON{ti1}))
+
+	start := time.Now()
+	for n := 0; n < 100; n++ {
+		err = tracker.CreateTableIfNotExists("testdb", fmt.Sprintf("foo-%d", n), ti1)
+		c.Assert(err, IsNil)
+	}
+	duration := time.Since(start)
+	c.Assert(duration.Seconds(), Less, float64(30))
 }
 
 func (s *trackerSuite) TestAllSchemas(c *C) {

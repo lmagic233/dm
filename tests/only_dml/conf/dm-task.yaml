@@ -3,10 +3,9 @@ name: test
 task-mode: all
 is-sharding: false
 meta-schema: "dm_meta"
-# enable-heartbeat: true
+enable-heartbeat: true
 heartbeat-update-interval: 1
 heartbeat-report-interval: 1
-timezone: "Asia/Shanghai"
 
 target-database:
   host: "127.0.0.1"
@@ -46,5 +45,5 @@ loaders:
 syncers:
   global:
     worker-count: 16
-    batch: 100
-    checkpoint-flush-interval: 3
+    batch: 10000
+    checkpoint-flush-interval: 300

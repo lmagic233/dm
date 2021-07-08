@@ -20,12 +20,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pingcap/dm/dm/config"
-	"github.com/pingcap/dm/dm/pb"
-	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dumpling/v4/export"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb-tools/pkg/filter"
+
+	"github.com/pingcap/dm/dm/config"
+	"github.com/pingcap/dm/dm/pb"
+	"github.com/pingcap/dm/pkg/log"
 
 	. "github.com/pingcap/check"
 )
@@ -127,4 +128,5 @@ func (d *testDumplingSuite) TestDefaultConfig(c *C) {
 	ctx := context.Background()
 	c.Assert(dumpling.Init(ctx), IsNil)
 	c.Assert(dumpling.dumpConfig.StatementSize, Not(Equals), export.UnspecifiedSize)
+	c.Assert(dumpling.dumpConfig.Rows, Not(Equals), export.UnspecifiedSize)
 }

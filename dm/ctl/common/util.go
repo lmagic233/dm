@@ -19,40 +19,48 @@ import (
 	"fmt"
 	"io/ioutil"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/pingcap/dm/dm/config"
-	"github.com/pingcap/dm/dm/pb"
-	parserpkg "github.com/pingcap/dm/pkg/parser"
-	"github.com/pingcap/dm/pkg/terror"
-	"github.com/pingcap/dm/pkg/utils"
-	"go.etcd.io/etcd/clientv3"
-
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
 	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser"
 	toolutils "github.com/pingcap/tidb-tools/pkg/utils"
 	"github.com/spf13/cobra"
+	"go.etcd.io/etcd/clientv3"
+	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+
+	"github.com/pingcap/dm/dm/config"
+	"github.com/pingcap/dm/dm/pb"
+	"github.com/pingcap/dm/pkg/log"
+	parserpkg "github.com/pingcap/dm/pkg/parser"
+	"github.com/pingcap/dm/pkg/terror"
+	"github.com/pingcap/dm/pkg/utils"
 )
 
 var (
 	globalConfig = &Config{}
-	ctlClient    = &CtlClient{}
+	// GlobalCtlClient is the globally used CtlClient in this package. Exposed to be used in test.
+	GlobalCtlClient = &CtlClient{}
+
+	re = regexp.MustCompile(`grpc: received message larger than max \((\d+) vs. (\d+)\)`)
 )
 
-// CtlClient used to get master client for dmctl
+// CtlClient used to get master client for dmctl.
 type CtlClient struct {
 	mu           sync.RWMutex
 	tls          *toolutils.TLS
 	etcdClient   *clientv3.Client
 	conn         *grpc.ClientConn
-	masterClient pb.MasterClient
+	MasterClient pb.MasterClient // exposed to be used in test
 }
 
 func (c *CtlClient) updateMasterClient() error {
@@ -74,19 +82,27 @@ func (c *CtlClient) updateMasterClient() error {
 		conn, err = grpc.Dial(utils.UnwrapScheme(endpoint), c.tls.ToGRPCDialOption(), grpc.WithBackoffMaxDelay(3*time.Second), grpc.WithBlock(), grpc.WithTimeout(3*time.Second))
 		if err == nil {
 			c.conn = conn
-			c.masterClient = pb.NewMasterClient(conn)
+			c.MasterClient = pb.NewMasterClient(conn)
 			return nil
 		}
 	}
 	return terror.ErrCtlGRPCCreateConn.AnnotateDelegate(err, "can't connect to %s", strings.Join(endpoints, ","))
 }
 
-func (c *CtlClient) sendRequest(ctx context.Context, reqName string, req interface{}, respPointer interface{}) error {
+func (c *CtlClient) sendRequest(
+	ctx context.Context,
+	reqName string,
+	req interface{},
+	respPointer interface{},
+	opts ...interface{}) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	params := []reflect.Value{reflect.ValueOf(ctx), reflect.ValueOf(req)}
-	results := reflect.ValueOf(c.masterClient).MethodByName(reqName).Call(params)
+	for _, o := range opts {
+		params = append(params, reflect.ValueOf(o))
+	}
+	results := reflect.ValueOf(c.MasterClient).MethodByName(reqName).Call(params)
 
 	reflect.ValueOf(respPointer).Elem().Set(results[0])
 	errInterface := results[1].Interface()
@@ -97,30 +113,49 @@ func (c *CtlClient) sendRequest(ctx context.Context, reqName string, req interfa
 	return errInterface.(error)
 }
 
-// SendRequest send request to master
+// SendRequest send request to master.
 func SendRequest(ctx context.Context, reqName string, req interface{}, respPointer interface{}) error {
-	err := ctlClient.sendRequest(ctx, reqName, req, respPointer)
-	if err == nil || status.Code(err) != codes.Unavailable {
+	err := GlobalCtlClient.sendRequest(ctx, reqName, req, respPointer)
+	if err == nil {
+		return nil
+	}
+	var opts []interface{}
+	switch status.Code(err) {
+	case codes.ResourceExhausted:
+		matches := re.FindStringSubmatch(err.Error())
+		if len(matches) == 3 {
+			msgSize, err2 := strconv.Atoi(matches[1])
+			if err2 == nil {
+				log.L().Info("increase gRPC maximum message size", zap.Int("size", msgSize))
+				opts = append(opts, grpc.MaxCallRecvMsgSize(msgSize))
+			}
+		}
+	case codes.Unavailable:
+	default:
 		return err
 	}
 
+	failpoint.Inject("SkipUpdateMasterClient", func() {
+		failpoint.Goto("bypass")
+	})
 	// update master client
-	err = ctlClient.updateMasterClient()
+	err = GlobalCtlClient.updateMasterClient()
 	if err != nil {
 		return err
 	}
+	failpoint.Label("bypass")
 
 	// sendRequest again
-	return ctlClient.sendRequest(ctx, reqName, req, respPointer)
+	return GlobalCtlClient.sendRequest(ctx, reqName, req, respPointer, opts...)
 }
 
-// InitUtils inits necessary dmctl utils
+// InitUtils inits necessary dmctl utils.
 func InitUtils(cfg *Config) error {
 	globalConfig = cfg
 	return errors.Trace(InitClient(cfg.MasterAddr, cfg.Security))
 }
 
-// InitClient initializes dm-master client
+// InitClient initializes dm-master client.
 func InitClient(addr string, securityCfg config.Security) error {
 	tls, err := toolutils.NewTLS(securityCfg.SSLCA, securityCfg.SSLCert, securityCfg.SSLKey, "", securityCfg.CertAllowedCN)
 	if err != nil {
@@ -139,39 +174,39 @@ func InitClient(addr string, securityCfg config.Security) error {
 		return err
 	}
 
-	ctlClient = &CtlClient{
+	GlobalCtlClient = &CtlClient{
 		tls:        tls,
 		etcdClient: etcdClient,
 	}
 
-	return ctlClient.updateMasterClient()
+	return GlobalCtlClient.updateMasterClient()
 }
 
-// GlobalConfig returns global dmctl config
+// GlobalConfig returns global dmctl config.
 func GlobalConfig() *Config {
 	return globalConfig
 }
 
-// PrintLines adds a wrap to support `\n` within `chzyer/readline`
-func PrintLines(format string, a ...interface{}) {
+// PrintLinesf adds a wrap to support `\n` within `chzyer/readline`.
+func PrintLinesf(format string, a ...interface{}) {
 	fmt.Println(fmt.Sprintf(format, a...))
 }
 
-// PrettyPrintResponse prints a PRC response prettily
+// PrettyPrintResponse prints a PRC response prettily.
 func PrettyPrintResponse(resp proto.Message) {
 	s, err := marshResponseToString(resp)
 	if err != nil {
-		PrintLines("%v", err)
+		PrintLinesf("%v", err)
 	} else {
 		fmt.Println(s)
 	}
 }
 
-// PrettyPrintInterface prints an interface through encoding/json prettily
+// PrettyPrintInterface prints an interface through encoding/json prettily.
 func PrettyPrintInterface(resp interface{}) {
 	s, err := json.MarshalIndent(resp, "", "    ")
 	if err != nil {
-		PrintLines("%v", err)
+		PrintLinesf("%v", err)
 	} else {
 		fmt.Println(string(s))
 	}
@@ -236,7 +271,7 @@ func PrettyPrintResponseWithCheckTask(resp proto.Message, subStr string) bool {
 	}
 
 	if err != nil {
-		PrintLines("%v", err)
+		PrintLinesf("%v", err)
 	} else {
 		// add indent to make it prettily.
 		replacedStr = strings.Replace(replacedStr, "detail: {", "   \tdetail: {", 1)
@@ -245,7 +280,7 @@ func PrettyPrintResponseWithCheckTask(resp proto.Message, subStr string) bool {
 	return found
 }
 
-// GetFileContent reads and returns file's content
+// GetFileContent reads and returns file's content.
 func GetFileContent(fpath string) ([]byte, error) {
 	content, err := ioutil.ReadFile(fpath)
 	if err != nil {
@@ -254,18 +289,18 @@ func GetFileContent(fpath string) ([]byte, error) {
 	return content, nil
 }
 
-// GetSourceArgs extracts sources from cmd
+// GetSourceArgs extracts sources from cmd.
 func GetSourceArgs(cmd *cobra.Command) ([]string, error) {
 	ret, err := cmd.Flags().GetStringSlice("source")
 	if err != nil {
-		PrintLines("error in parse `-s` / `--source`")
+		PrintLinesf("error in parse `-s` / `--source`")
 	}
 	return ret, err
 }
 
 // ExtractSQLsFromArgs extract multiple sql from args.
 func ExtractSQLsFromArgs(args []string) ([]string, error) {
-	if len(args) <= 0 {
+	if len(args) == 0 {
 		return nil, errors.New("args is empty")
 	}
 
@@ -288,7 +323,7 @@ func ExtractSQLsFromArgs(args []string) ([]string, error) {
 	return realSQLs, nil
 }
 
-// GetTaskNameFromArgOrFile tries to retrieve name from the file if arg is yaml-filename-like, otherwise returns arg directly
+// GetTaskNameFromArgOrFile tries to retrieve name from the file if arg is yaml-filename-like, otherwise returns arg directly.
 func GetTaskNameFromArgOrFile(arg string) string {
 	if !(strings.HasSuffix(arg, ".yaml") || strings.HasSuffix(arg, ".yml")) {
 		return arg
@@ -309,19 +344,18 @@ func GetTaskNameFromArgOrFile(arg string) string {
 
 // PrintCmdUsage prints the usage of the command.
 func PrintCmdUsage(cmd *cobra.Command) {
-	err := cmd.Usage()
-	if err != nil {
+	if err := cmd.Usage(); err != nil {
 		fmt.Println("can't output command's usage:", err)
 	}
 }
 
-// SyncMasterEndpoints sync masters' endpoints
+// SyncMasterEndpoints sync masters' endpoints.
 func SyncMasterEndpoints(ctx context.Context) {
 	lastClientUrls := []string{}
 	clientURLs := []string{}
 	updateF := func() {
 		clientURLs = clientURLs[:0]
-		resp, err := ctlClient.etcdClient.MemberList(ctx)
+		resp, err := GlobalCtlClient.etcdClient.MemberList(ctx)
 		if err != nil {
 			return
 		}
@@ -332,7 +366,7 @@ func SyncMasterEndpoints(ctx context.Context) {
 		if utils.NonRepeatStringsEqual(clientURLs, lastClientUrls) {
 			return
 		}
-		ctlClient.etcdClient.SetEndpoints(clientURLs...)
+		GlobalCtlClient.etcdClient.SetEndpoints(clientURLs...)
 		lastClientUrls = make([]string, len(clientURLs))
 		copy(lastClientUrls, clientURLs)
 	}

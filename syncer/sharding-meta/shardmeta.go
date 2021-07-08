@@ -17,8 +17,8 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
-	"github.com/siddontang/go-mysql/mysql"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/pkg/binlog"
@@ -28,7 +28,7 @@ import (
 	"github.com/pingcap/dm/pkg/utils"
 )
 
-// DDLItem records ddl information used in sharding sequence organization
+// DDLItem records ddl information used in sharding sequence organization.
 type DDLItem struct {
 	FirstLocation binlog.Location `json:"-"`      // first DDL's binlog Pos, not the End_log_pos of the event
 	DDLs          []string        `json:"ddls"`   // DDLs, these ddls are in the same QueryEvent
@@ -40,7 +40,7 @@ type DDLItem struct {
 	FirstGTIDSet  string         `json:"first-gtid-set"`
 }
 
-// NewDDLItem creates a new DDLItem
+// NewDDLItem creates a new DDLItem.
 func NewDDLItem(location binlog.Location, ddls []string, source string) *DDLItem {
 	gsetStr := ""
 	if location.GetGTID() != nil {
@@ -57,12 +57,12 @@ func NewDDLItem(location binlog.Location, ddls []string, source string) *DDLItem
 	}
 }
 
-// String returns the item's format string value
+// String returns the item's format string value.
 func (item *DDLItem) String() string {
 	return fmt.Sprintf("first-location: %s ddls: %+v source: %s", item.FirstLocation, item.DDLs, item.Source)
 }
 
-// ShardingSequence records a list of DDLItem
+// ShardingSequence records a list of DDLItem.
 type ShardingSequence struct {
 	Items []*DDLItem `json:"items"`
 }
@@ -80,7 +80,7 @@ func (seq *ShardingSequence) IsPrefixSequence(other *ShardingSequence) bool {
 	return true
 }
 
-// String returns the ShardingSequence's json string
+// String returns the ShardingSequence's json string.
 func (seq *ShardingSequence) String() string {
 	jsonSeq, err := json.Marshal(seq.Items)
 	if err != nil {
@@ -91,7 +91,7 @@ func (seq *ShardingSequence) String() string {
 
 // ShardingMeta stores sharding ddl sequence
 // including global sequence and each source's own sequence
-// NOTE: sharding meta is not thread safe, it must be used in thread safe context
+// NOTE: sharding meta is not thread safe, it must be used in thread safe context.
 type ShardingMeta struct {
 	activeIdx int                          // the first unsynced DDL index
 	global    *ShardingSequence            // merged sharding sequence of all source tables
@@ -101,7 +101,7 @@ type ShardingMeta struct {
 	enableGTID bool // whether enableGTID, used to compare location
 }
 
-// NewShardingMeta creates a new ShardingMeta
+// NewShardingMeta creates a new ShardingMeta.
 func NewShardingMeta(schema, table string, enableGTID bool) *ShardingMeta {
 	return &ShardingMeta{
 		tableName: dbutil.TableName(schema, table),
@@ -112,7 +112,7 @@ func NewShardingMeta(schema, table string, enableGTID bool) *ShardingMeta {
 	}
 }
 
-// RestoreFromData restores ShardingMeta from given data
+// RestoreFromData restores ShardingMeta from given data.
 func (meta *ShardingMeta) RestoreFromData(sourceTableID string, activeIdx int, isGlobal bool, data []byte, flavor string) error {
 	items := make([]*DDLItem, 0)
 	err := json.Unmarshal(data, &items)
@@ -141,12 +141,12 @@ func (meta *ShardingMeta) RestoreFromData(sourceTableID string, activeIdx int, i
 	return nil
 }
 
-// ActiveIdx returns the activeIdx of sharding meta
+// ActiveIdx returns the activeIdx of sharding meta.
 func (meta *ShardingMeta) ActiveIdx() int {
 	return meta.activeIdx
 }
 
-// Reinitialize reinitialize the shardingmeta
+// Reinitialize reinitialize the shardingmeta.
 func (meta *ShardingMeta) Reinitialize() {
 	meta.activeIdx = 0
 	meta.global = &ShardingSequence{make([]*DDLItem, 0)}
@@ -172,7 +172,7 @@ func (meta *ShardingMeta) checkItemExists(item *DDLItem) (int, bool) {
 // AddItem adds a new coming DDLItem into ShardingMeta
 // 1. if DDLItem already exists in source sequence, check whether it is active DDL only
 // 2. add the DDLItem into its related source sequence
-// 3. if it is a new DDL in global sequence, add it into global sequence
+// 3. if it is a new DDL in global sequence, which means len(source.Items) > len(global.Items), add it into global sequence
 // 4. check the source sequence is the prefix-sequence of global sequence, if not, return an error
 // returns:
 //   active: whether the DDL will be processed in this round
@@ -188,18 +188,11 @@ func (meta *ShardingMeta) AddItem(item *DDLItem) (active bool, err error) {
 		source.Items = append(source.Items, item)
 	}
 
-	found := false
-	for _, globalItem := range meta.global.Items {
-		if utils.CompareShardingDDLs(item.DDLs, globalItem.DDLs) {
-			found = true
-			break
-		}
-	}
-	if !found {
-		meta.global.Items = append(meta.global.Items, item)
+	global, source := meta.global, meta.sources[item.Source]
+	if len(source.Items) > len(global.Items) {
+		global.Items = append(global.Items, item)
 	}
 
-	global, source := meta.global, meta.sources[item.Source]
 	if !source.IsPrefixSequence(global) {
 		return false, terror.ErrSyncUnitDDLWrongSequence.Generate(source.Items, global.Items)
 	}
@@ -207,7 +200,7 @@ func (meta *ShardingMeta) AddItem(item *DDLItem) (active bool, err error) {
 	return index == meta.activeIdx, nil
 }
 
-// GetGlobalActiveDDL returns activeDDL in global sequence
+// GetGlobalActiveDDL returns activeDDL in global sequence.
 func (meta *ShardingMeta) GetGlobalActiveDDL() *DDLItem {
 	if meta.activeIdx < len(meta.global.Items) {
 		return meta.global.Items[meta.activeIdx]
@@ -215,14 +208,14 @@ func (meta *ShardingMeta) GetGlobalActiveDDL() *DDLItem {
 	return nil
 }
 
-// GetGlobalItems returns global DDLItems
+// GetGlobalItems returns global DDLItems.
 func (meta *ShardingMeta) GetGlobalItems() []*DDLItem {
 	return meta.global.Items
 }
 
 // GetActiveDDLItem returns the source table's active DDLItem
 // if in DDL unsynced procedure, the active DDLItem means the syncing DDL
-// if in re-sync procedure, the active DDLItem means the next syncing DDL in DDL syncing sequence, may be nil
+// if in re-sync procedure, the active DDLItem means the next syncing DDL in DDL syncing sequence, may be nil.
 func (meta *ShardingMeta) GetActiveDDLItem(tableSource string) *DDLItem {
 	source, ok := meta.sources[tableSource]
 	if !ok {
@@ -234,7 +227,7 @@ func (meta *ShardingMeta) GetActiveDDLItem(tableSource string) *DDLItem {
 	return nil
 }
 
-// InSequenceSharding returns whether in sequence sharding
+// InSequenceSharding returns whether in sequence sharding.
 func (meta *ShardingMeta) InSequenceSharding() bool {
 	globalItemCount := len(meta.global.Items)
 	return globalItemCount > 0 && meta.activeIdx < globalItemCount
@@ -253,7 +246,7 @@ func (meta *ShardingMeta) ResolveShardingDDL() bool {
 	return false
 }
 
-// ActiveDDLFirstLocation returns the first binlog position of active DDL
+// ActiveDDLFirstLocation returns the first binlog position of active DDL.
 func (meta *ShardingMeta) ActiveDDLFirstLocation() (binlog.Location, error) {
 	if meta.activeIdx >= len(meta.global.Items) {
 		return binlog.Location{}, terror.ErrSyncUnitDDLActiveIndexLarger.Generate(meta.activeIdx, meta.global.Items)
@@ -262,7 +255,7 @@ func (meta *ShardingMeta) ActiveDDLFirstLocation() (binlog.Location, error) {
 	return meta.global.Items[meta.activeIdx].FirstLocation, nil
 }
 
-// FlushData returns sharding meta flush SQL and args
+// FlushData returns sharding meta flush SQL and args.
 func (meta *ShardingMeta) FlushData(sourceID, tableID string) ([]string, [][]interface{}) {
 	if len(meta.global.Items) == 0 {
 		sql2 := fmt.Sprintf("DELETE FROM %s where source_id=? and target_table_id=?", meta.tableName)

@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/siddontang/go/sync2"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/pkg/log"
@@ -26,12 +26,10 @@ import (
 	"github.com/pingcap/dm/pkg/utils"
 )
 
-var (
-	fakeTaskName = strategyFilename.String()
-)
+var fakeTaskName = strategyFilename.String()
 
 // filenameArgs represents args needed by filenameStrategy
-// NOTE: should handle master-slave switch
+// NOTE: should handle master-slave switch.
 type filenameArgs struct {
 	relayBaseDir string
 	filename     string // specified end safe filename
@@ -79,9 +77,9 @@ func (fa *filenameArgs) String() string {
 }
 
 // filenameStrategy represents a relay purge strategy by filename
-// similar to `PURGE BINARY LOGS TO`
+// similar to `PURGE BINARY LOGS TO`.
 type filenameStrategy struct {
-	purging sync2.AtomicInt32
+	purging atomic.Bool
 
 	logger log.Logger
 }
@@ -98,10 +96,10 @@ func (s *filenameStrategy) Check(args interface{}) (bool, error) {
 }
 
 func (s *filenameStrategy) Do(args interface{}) error {
-	if !s.purging.CompareAndSwap(0, 1) {
+	if !s.purging.CAS(false, true) {
 		return terror.ErrRelayThisStrategyIsPurging.Generate()
 	}
-	defer s.purging.Set(0)
+	defer s.purging.Store(false)
 
 	fa, ok := args.(*filenameArgs)
 	if !ok {
@@ -112,7 +110,7 @@ func (s *filenameStrategy) Do(args interface{}) error {
 }
 
 func (s *filenameStrategy) Purging() bool {
-	return s.purging.Get() > 0
+	return s.purging.Load()
 }
 
 func (s *filenameStrategy) Type() strategyType {

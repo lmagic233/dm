@@ -15,13 +15,14 @@ package syncer
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/pingcap/failpoint"
-	"github.com/siddontang/go-mysql/mysql"
-	"github.com/siddontang/go-mysql/replication"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/pkg/binlog"
@@ -39,12 +40,12 @@ import (
 // And we can't simplely use StartSync() method in SteamerProducer
 // so use generateStreamer to wrap StartSync() method to make *BinlogSyncer and *BinlogReader in same interface
 // For other implementations who implement StreamerProducer and Streamer can easily take place of Syncer.streamProducer
-// For test is easy to mock
+// For test is easy to mock.
 type StreamerProducer interface {
 	generateStreamer(location binlog.Location) (streamer.Streamer, error)
 }
 
-// Read local relay log
+// Read local relay log.
 type localBinlogReader struct {
 	reader     *streamer.BinlogReader
 	EnableGTID bool
@@ -57,7 +58,7 @@ func (l *localBinlogReader) generateStreamer(location binlog.Location) (streamer
 	return l.reader.StartSyncByPos(location.Position)
 }
 
-// Read remote binlog
+// Read remote binlog.
 type remoteBinlogReader struct {
 	reader     *replication.BinlogSyncer
 	tctx       *tcontext.Context
@@ -85,7 +86,7 @@ func (r *remoteBinlogReader) generateStreamer(location binlog.Location) (streame
 // StreamerController controls the streamer for read binlog, include:
 // 1. reopen streamer
 // 2. redirect binlog position or gtid
-// 3. transfor from local streamer to remote streamer
+// 3. transfor from local streamer to remote streamer.
 type StreamerController struct {
 	sync.RWMutex
 
@@ -117,7 +118,7 @@ type StreamerController struct {
 	serverIDUpdated bool
 }
 
-// NewStreamerController creates a new streamer controller
+// NewStreamerController creates a new streamer controller.
 func NewStreamerController(syncCfg replication.BinlogSyncerConfig, enableGTID bool, fromDB *UpStreamConn, binlogType BinlogType, localBinlogDir string, timezone *time.Location) *StreamerController {
 	streamerController := &StreamerController{
 		initBinlogType:    binlogType,
@@ -133,7 +134,7 @@ func NewStreamerController(syncCfg replication.BinlogSyncerConfig, enableGTID bo
 	return streamerController
 }
 
-// Start starts streamer controller
+// Start starts streamer controller.
 func (c *StreamerController) Start(tctx *tcontext.Context, location binlog.Location) error {
 	c.Lock()
 	defer c.Unlock()
@@ -156,7 +157,7 @@ func (c *StreamerController) Start(tctx *tcontext.Context, location binlog.Locat
 	return nil
 }
 
-// ResetReplicationSyncer reset the replication
+// ResetReplicationSyncer reset the replication.
 func (c *StreamerController) ResetReplicationSyncer(tctx *tcontext.Context, location binlog.Location) (err error) {
 	c.Lock()
 	defer c.Unlock()
@@ -212,7 +213,7 @@ func (c *StreamerController) resetReplicationSyncer(tctx *tcontext.Context, loca
 	return err
 }
 
-// RedirectStreamer redirects the streamer's begin position or gtid
+// RedirectStreamer redirects the streamer's begin position or gtid.
 func (c *StreamerController) RedirectStreamer(tctx *tcontext.Context, location binlog.Location) error {
 	c.Lock()
 	defer c.Unlock()
@@ -249,9 +250,13 @@ func (c *StreamerController) GetEvent(tctx *tcontext.Context) (event *replicatio
 
 	event, err = streamer.GetEvent(ctx)
 	cancel()
+	failpoint.Inject("GetEventError", func() {
+		err = errors.New("go-mysql returned an error")
+	})
 	if err != nil {
 		if err != context.Canceled && err != context.DeadlineExceeded {
 			c.Lock()
+			tctx.L().Error("meet error when get binlog event", zap.Error(err))
 			c.meetError = true
 			c.Unlock()
 		}
@@ -284,7 +289,7 @@ func (c *StreamerController) GetEvent(tctx *tcontext.Context) (event *replicatio
 	return event, nil
 }
 
-// ReopenWithRetry reopens streamer with retry
+// ReopenWithRetry reopens streamer with retry.
 func (c *StreamerController) ReopenWithRetry(tctx *tcontext.Context, location binlog.Location) error {
 	c.Lock()
 	defer c.Unlock()
@@ -327,7 +332,7 @@ func (c *StreamerController) closeBinlogSyncer(logtctx *tcontext.Context, binlog
 	return nil
 }
 
-// Close closes streamer
+// Close closes streamer.
 func (c *StreamerController) Close(tctx *tcontext.Context) {
 	c.Lock()
 	c.close(tctx)
@@ -357,7 +362,7 @@ func (c *StreamerController) close(tctx *tcontext.Context) {
 	c.closed = true
 }
 
-// IsClosed returns whether streamer controller is closed
+// IsClosed returns whether streamer controller is closed.
 func (c *StreamerController) IsClosed() bool {
 	c.RLock()
 	defer c.RUnlock()
@@ -376,7 +381,7 @@ func (c *StreamerController) setUUIDIfExists(filename string) bool {
 	return true
 }
 
-// UpdateSyncCfg updates sync config and fromDB
+// UpdateSyncCfg updates sync config and fromDB.
 func (c *StreamerController) UpdateSyncCfg(syncCfg replication.BinlogSyncerConfig, fromDB *UpStreamConn) {
 	c.Lock()
 	c.fromDB = fromDB
@@ -384,11 +389,12 @@ func (c *StreamerController) UpdateSyncCfg(syncCfg replication.BinlogSyncerConfi
 	c.Unlock()
 }
 
-// check whether the uuid in binlog position's name is same with upstream
+// check whether the uuid in binlog position's name is same with upstream.
 func (c *StreamerController) checkUUIDSameWithUpstream(ctx context.Context, pos mysql.Position, uuids []string) (bool, error) {
 	_, uuidSuffix, _, err := binlog.SplitFilenameWithUUIDSuffix(pos.Name)
 	if err != nil {
 		// don't contain uuid in position's name
+		// nolint:nilerr
 		return true, nil
 	}
 	uuid := utils.GetUUIDBySuffix(uuids, uuidSuffix)
@@ -401,14 +407,14 @@ func (c *StreamerController) checkUUIDSameWithUpstream(ctx context.Context, pos 
 	return uuid == upstreamUUID, nil
 }
 
-// GetBinlogType returns the binlog type used now
+// GetBinlogType returns the binlog type used now.
 func (c *StreamerController) GetBinlogType() BinlogType {
 	c.RLock()
 	defer c.RUnlock()
 	return c.currentBinlogType
 }
 
-// CanRetry returns true if can switch from local to remote and retry again
+// CanRetry returns true if can switch from local to remote and retry again.
 func (c *StreamerController) CanRetry() bool {
 	c.RLock()
 	defer c.RUnlock()
@@ -432,7 +438,7 @@ func (c *StreamerController) updateServerID(tctx *tcontext.Context) error {
 	return nil
 }
 
-// UpdateServerIDAndResetReplication updates the server id and reset replication
+// UpdateServerIDAndResetReplication updates the server id and reset replication.
 func (c *StreamerController) UpdateServerIDAndResetReplication(tctx *tcontext.Context, location binlog.Location) error {
 	c.Lock()
 	defer c.Unlock()

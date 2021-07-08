@@ -19,11 +19,13 @@ import (
 	"fmt"
 
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb-tools/pkg/schemacmp"
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/mvcc/mvccpb"
 
 	"github.com/pingcap/dm/dm/common"
 	"github.com/pingcap/dm/pkg/etcdutil"
+	"github.com/pingcap/dm/pkg/log"
 )
 
 // TODO: much of the code in optimistic mode is very similar to pessimistic mode, we can try to combine them together.
@@ -53,11 +55,35 @@ type Info struct {
 
 	// only set it when get/watch from etcd
 	Version int64 `json:"-"`
+
+	// only set it when get from etcd
+	// use for sort infos in recoverlock
+	Revision int64 `json:"-"`
+
+	// use to resolve conflict
+	IgnoreConflict bool `json:"ignore-conflict"`
+}
+
+// LogInfo replace TableInfo with schema.Table.String() for log.
+type LogInfo struct {
+	Task           string   `json:"task"`
+	Source         string   `json:"source"`
+	UpSchema       string   `json:"up-schema"`
+	UpTable        string   `json:"up-table"`
+	DownSchema     string   `json:"down-schema"`
+	DownTable      string   `json:"down-table"`
+	DDLs           []string `json:"ddls"`
+	TableBefore    string   `json:"table-before"`
+	TableAfter     string   `json:"table-after"`
+	IsDeleted      bool     `json:"is-deleted"`
+	Version        int64    `json:"version"`
+	Revision       int64    `json:"revision"`
+	IgnoreConflict bool     `json:"ignore-conflict"`
 }
 
 // NewInfo creates a new Info instance.
 func NewInfo(task, source, upSchema, upTable, downSchema, downTable string,
-	DDLs []string, tableInfoBefore *model.TableInfo, tableInfosAfter []*model.TableInfo) Info {
+	ddls []string, tableInfoBefore *model.TableInfo, tableInfosAfter []*model.TableInfo) Info {
 	return Info{
 		Task:            task,
 		Source:          source,
@@ -65,7 +91,7 @@ func NewInfo(task, source, upSchema, upTable, downSchema, downTable string,
 		UpTable:         upTable,
 		DownSchema:      downSchema,
 		DownTable:       downTable,
-		DDLs:            DDLs,
+		DDLs:            ddls,
 		TableInfoBefore: tableInfoBefore,
 		TableInfosAfter: tableInfosAfter,
 	}
@@ -75,6 +101,40 @@ func NewInfo(task, source, upSchema, upTable, downSchema, downTable string,
 func (i Info) String() string {
 	s, _ := i.toJSON()
 	return s
+}
+
+// ShortString returns short string of Info.
+func (i *Info) ShortString() string {
+	logInfo := LogInfo{
+		Task:           i.Task,
+		Source:         i.Source,
+		UpSchema:       i.UpSchema,
+		UpTable:        i.UpTable,
+		DownSchema:     i.DownSchema,
+		DownTable:      i.DownTable,
+		DDLs:           i.DDLs,
+		IsDeleted:      i.IsDeleted,
+		Version:        i.Version,
+		Revision:       i.Revision,
+		IgnoreConflict: i.IgnoreConflict,
+	}
+	if i.TableInfoBefore != nil {
+		logInfo.TableBefore = schemacmp.Encode(i.TableInfoBefore).String()
+	}
+	if len(i.TableInfosAfter) != 0 {
+		logInfo.TableAfter = schemacmp.Encode(i.TableInfosAfter[len(i.TableInfosAfter)-1]).String()
+	}
+	s, _ := logInfo.toJSON()
+	return s
+}
+
+// toJSON returns the string of JSON represent.
+func (i LogInfo) toJSON() (string, error) {
+	data, err := json.Marshal(i)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // toJSON returns the string of JSON represent.
@@ -89,6 +149,18 @@ func (i Info) toJSON() (string, error) {
 // infoFromJSON constructs Info from its JSON represent.
 func infoFromJSON(s string) (i Info, err error) {
 	err = json.Unmarshal([]byte(s), &i)
+	if err != nil {
+		// For compatibility.
+		// In v2.0.2, we changed struct of table-info-after but forgot to upgrade etcd value.
+		// To keep the ModRevision of info, we change them after getting info instead of change all the value in etcd when upgrade
+		// All the Info will be upgraded after new info putted or lock resolved.
+		oldInfo, newErr := oldInfoFromJSON(s)
+		if newErr != nil {
+			log.L().Error("unmarshal old info", log.ShortError(newErr))
+			return
+		}
+		return oldInfo.toInfo(), nil
+	}
 	return
 }
 
@@ -129,6 +201,7 @@ func GetAllInfo(cli *clientv3.Client) (map[string]map[string]map[string]map[stri
 			return nil, 0, err2
 		}
 		info.Version = kv.Version
+		info.Revision = kv.ModRevision
 
 		if _, ok := ifm[info.Task]; !ok {
 			ifm[info.Task] = make(map[string]map[string]map[string]Info)
@@ -179,6 +252,7 @@ func WatchInfo(ctx context.Context, cli *clientv3.Client, revision int64,
 				case mvccpb.PUT:
 					info, err = infoFromJSON(string(ev.Kv.Value))
 					info.Version = ev.Kv.Version
+					info.Revision = ev.Kv.ModRevision
 				case mvccpb.DELETE:
 					info, err = infoFromJSON(string(ev.PrevKv.Value))
 					info.IsDeleted = true
@@ -229,6 +303,42 @@ func ClearTestInfoOperationSchema(cli *clientv3.Client) error {
 	clearInfo := clientv3.OpDelete(common.ShardDDLOptimismInfoKeyAdapter.Path(), clientv3.WithPrefix())
 	clearOp := clientv3.OpDelete(common.ShardDDLOptimismOperationKeyAdapter.Path(), clientv3.WithPrefix())
 	clearISOp := clientv3.OpDelete(common.ShardDDLOptimismInitSchemaKeyAdapter.Path(), clientv3.WithPrefix())
-	_, err := cli.Txn(context.Background()).Then(clearSource, clearInfo, clearOp, clearISOp).Commit()
+	clearColumns := clientv3.OpDelete(common.ShardDDLOptimismDroppedColumnsKeyAdapter.Path(), clientv3.WithPrefix())
+	_, err := cli.Txn(context.Background()).Then(clearSource, clearInfo, clearOp, clearISOp, clearColumns).Commit()
 	return err
+}
+
+// OldInfo represents info in etcd before v2.0.2.
+type OldInfo struct {
+	Task       string   `json:"task"`
+	Source     string   `json:"source"`
+	UpSchema   string   `json:"up-schema"`
+	UpTable    string   `json:"up-table"`
+	DownSchema string   `json:"down-schema"`
+	DownTable  string   `json:"down-table"`
+	DDLs       []string `json:"ddls"`
+
+	TableInfoBefore *model.TableInfo `json:"table-info-before"` // the tracked table schema before applying the DDLs
+	TableInfoAfter  *model.TableInfo `json:"table-info-after"`  // the tracked table schema after applying the DDLs
+}
+
+// oldInfoFromJSON constructs OldInfo from its JSON represent.
+func oldInfoFromJSON(s string) (oldInfo OldInfo, err error) {
+	err = json.Unmarshal([]byte(s), &oldInfo)
+	return
+}
+
+// toInfo converts OldInfo to Info.
+func (oldInfo *OldInfo) toInfo() Info {
+	return Info{
+		Task:            oldInfo.Task,
+		Source:          oldInfo.Source,
+		UpSchema:        oldInfo.UpSchema,
+		UpTable:         oldInfo.UpTable,
+		DownSchema:      oldInfo.DownSchema,
+		DownTable:       oldInfo.DownTable,
+		DDLs:            oldInfo.DDLs,
+		TableInfoBefore: oldInfo.TableInfoBefore,
+		TableInfosAfter: []*model.TableInfo{oldInfo.TableInfoAfter},
+	}
 }

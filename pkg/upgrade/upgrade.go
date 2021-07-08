@@ -16,29 +16,36 @@ package upgrade
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"go.etcd.io/etcd/clientv3"
 	"go.uber.org/zap"
 
+	"github.com/pingcap/dm/dm/common"
 	"github.com/pingcap/dm/dm/config"
 	"github.com/pingcap/dm/pkg/conn"
 	tcontext "github.com/pingcap/dm/pkg/context"
 	"github.com/pingcap/dm/pkg/cputil"
+	"github.com/pingcap/dm/pkg/etcdutil"
 	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dm/pkg/utils"
 )
 
-var (
-	// upgrades records all functions used to upgrade from one version to the later version.
-	upgrades = []func(cli *clientv3.Client, uctx Context) error{
-		upgradeToVer1,
-		upgradeToVer2,
-	}
-)
+// upgrades records all functions used to upgrade from one version to the later version.
+var upgrades = []func(cli *clientv3.Client, uctx Context) error{
+	upgradeToVer1,
+	upgradeToVer2,
+	upgradeToVer4,
+}
+
+// upgradesBeforeScheduler records all upgrade functions before scheduler start. e.g. etcd key changed.
+var upgradesBeforeScheduler = []func(ctx context.Context, cli *clientv3.Client) error{
+	upgradeToVer3,
+}
 
 // Context is used to pass something to TryUpgrade
-// NOTE that zero value of Context is nil, be aware of nil-dereference
+// NOTE that zero value of Context is nil, be aware of nil-dereference.
 type Context struct {
 	context.Context
 	SubTaskConfigs map[string]map[string]config.SubTaskConfig
@@ -65,11 +72,10 @@ func TryUpgrade(cli *clientv3.Client, uctx Context) error {
 
 	// 2. check if any previous version exists.
 	if preVer.NotSet() {
-		// no initialization operations exist for Ver1 now,
-		// add any operations (may includes `upgrades`) if needed later.
-		// put the current version into etcd.
-		_, err = PutVersion(cli, CurrentVersion)
-		return err
+		if _, err = PutVersion(cli, MinVersion); err != nil {
+			return err
+		}
+		preVer = MinVersion
 	}
 
 	// 3. compare the previous version with the current version.
@@ -92,7 +98,58 @@ func TryUpgrade(cli *clientv3.Client, uctx Context) error {
 
 	// 5. put the current version into etcd.
 	_, err = PutVersion(cli, CurrentVersion)
+	log.L().Info("upgrade cluster version", zap.Any("version", CurrentVersion), zap.Error(err))
 	return err
+}
+
+// TryUpgradeBeforeSchedulerStart tries to upgrade the cluster before scheduler start.
+// This methods should have no side effects even calling multiple times.
+func TryUpgradeBeforeSchedulerStart(ctx context.Context, cli *clientv3.Client) error {
+	// 1. get previous version from etcd.
+	preVer, _, err := GetVersion(cli)
+	log.L().Info("fetch previous version", zap.Any("preVer", preVer))
+	if err != nil {
+		return err
+	}
+
+	// 2. check if any previous version exists.
+	if preVer.NotSet() {
+		if _, err = PutVersion(cli, MinVersion); err != nil {
+			return err
+		}
+		preVer = MinVersion
+	}
+
+	// 3. compare the previous version with the current version.
+	if cmp := preVer.Compare(CurrentVersion); cmp == 0 {
+		// previous == current version, no need to upgrade.
+		return nil
+	} else if cmp > 0 {
+		// previous >= current version, this often means a older version of DM-master become the leader after started,
+		// do nothing for this now.
+		return nil
+	}
+
+	// 4. do upgrade operations.
+	for _, upgrade := range upgradesBeforeScheduler {
+		err = upgrade(ctx, cli)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// UntouchVersionUpgrade runs all upgrade functions but doesn't change cluster version. This function is called when
+// upgrade from v1.0, with a later PutVersion in caller after success.
+func UntouchVersionUpgrade(cli *clientv3.Client, uctx Context) error {
+	for _, upgrade := range upgrades {
+		err := upgrade(cli, uctx)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // upgradeToVer1 does upgrade operations from Ver0 to Ver1.
@@ -101,8 +158,7 @@ func upgradeToVer1(cli *clientv3.Client, uctx Context) error {
 	return nil
 }
 
-// upgradeToVer2 does upgrade operations from Ver1 to Ver2 (v2.0.0-rc.3) to upgrade syncer checkpoint schema
-// TODO: determine v2.0.0-rc.3 or another version in above line
+// upgradeToVer2 does upgrade operations from Ver1 to Ver2 (v2.0.0-GA) to upgrade syncer checkpoint schema.
 func upgradeToVer2(cli *clientv3.Client, uctx Context) error {
 	upgradeTaskName := "upgradeToVer2"
 	logger := log.L().WithFields(zap.String("task", upgradeTaskName))
@@ -133,6 +189,13 @@ func upgradeToVer2(cli *clientv3.Client, uctx Context) error {
 			db.Close()
 		}
 	}()
+
+	// 10 seconds for each subtask
+	timeout := time.Duration(len(dbConfigs)*10) * time.Second
+	upgradeCtx, cancel := context.WithTimeout(context.Background(), timeout)
+	uctx.Context = upgradeCtx
+	defer cancel()
+
 	for tableName, cfg := range dbConfigs {
 		targetDB, err := conn.DefaultDBProvider.Apply(cfg)
 		if err != nil {
@@ -160,5 +223,55 @@ func upgradeToVer2(cli *clientv3.Client, uctx Context) error {
 		}
 	}
 
+	return nil
+}
+
+// upgradeToVer3 does upgrade operations from Ver2 (v2.0.0-GA) to Ver3 (v2.0.2) to upgrade etcd key encodings.
+// This func should be called before scheduler start.
+func upgradeToVer3(ctx context.Context, cli *clientv3.Client) error {
+	etcdKeyUpgrades := []struct {
+		old common.KeyAdapter
+		new common.KeyAdapter
+	}{
+		{
+			common.UpstreamConfigKeyAdapterV1,
+			common.UpstreamConfigKeyAdapter,
+		},
+		{
+			common.StageRelayKeyAdapterV1,
+			common.StageRelayKeyAdapter,
+		},
+	}
+
+	ops := make([]clientv3.Op, 0, len(etcdKeyUpgrades))
+	for _, pair := range etcdKeyUpgrades {
+		resp, err := cli.Get(ctx, pair.old.Path(), clientv3.WithPrefix())
+		if err != nil {
+			return err
+		}
+		if len(resp.Kvs) == 0 {
+			log.L().Info("no old KVs, skipping", zap.String("etcd path", pair.old.Path()))
+			continue
+		}
+		for _, kv := range resp.Kvs {
+			keys, err2 := pair.old.Decode(string(kv.Key))
+			if err2 != nil {
+				return err2
+			}
+			newKey := pair.new.Encode(keys...)
+
+			// note that we lost CreateRevision, Lease, ModRevision, Version
+			ops = append(ops, clientv3.OpPut(newKey, string(kv.Value)))
+		}
+		// delete old key to provide idempotence
+		ops = append(ops, clientv3.OpDelete(pair.old.Path(), clientv3.WithPrefix()))
+	}
+	_, _, err := etcdutil.DoOpsInOneTxnWithRetry(cli, ops...)
+	return err
+}
+
+// upgradeToVer4 does nothing, version 4 is just to make sure cluster from version 3 could re-run bootstrap, because
+// version 3 (v2.0.2) has some bugs and user may downgrade.
+func upgradeToVer4(cli *clientv3.Client, uctx Context) error {
 	return nil
 }

@@ -17,7 +17,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/ast"
@@ -25,10 +24,10 @@ import (
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	tidbConfig "github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/infoschema"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/store/mockstore"
 	"go.uber.org/zap"
@@ -39,11 +38,20 @@ import (
 )
 
 const (
-	waitDDLRetryCount = 10
+	// TiDBClusteredIndex is the variable name for clustered index.
+	TiDBClusteredIndex = "tidb_enable_clustered_index"
+	// TiDBChangeColumnType is the variable name for column type changing.
+	TiDBChangeColumnType = "tidb_enable_change_column_type"
 )
 
 var (
-	sessionVars = []string{"sql_mode", "tidb_skip_utf8_check"}
+	// don't read clustered index variable from downstream because it may changed during syncing
+	// we always using OFF tidb_enable_clustered_index unless user set it in config.
+	downstreamVars    = []string{"sql_mode", "tidb_skip_utf8_check"}
+	defaultGlobalVars = map[string]string{
+		TiDBClusteredIndex:   "OFF",
+		TiDBChangeColumnType: "ON", // NOTE The default value of tidb_enable_change_column_type was changed to ON after the release of TiDB 5.1.
+	}
 )
 
 // Tracker is used to track schema locally.
@@ -55,11 +63,11 @@ type Tracker struct {
 
 // NewTracker creates a new tracker. `sessionCfg` will be set as tracker's session variables if specified, or retrieve
 // some variable from downstream TiDB using `tidbConn`.
+// NOTE **sessionCfg is a reference to caller**.
 func NewTracker(ctx context.Context, task string, sessionCfg map[string]string, tidbConn *conn.BaseConn) (*Tracker, error) {
 	// NOTE: tidb uses a **global** config so can't isolate tracker's config from each other. If that isolation is needed,
 	// we might SetGlobalConfig before every call to tracker, or use some patch like https://github.com/bouk/monkey
 	toSet := tidbConfig.NewConfig()
-	toSet.AlterPrimaryKey = true
 	// bypass wait time of https://github.com/pingcap/tidb/pull/20550
 	toSet.TiKVClient.AsyncCommit.SafeWindow = 0
 	toSet.TiKVClient.AsyncCommit.AllowedClockDrift = 0
@@ -71,8 +79,8 @@ func NewTracker(ctx context.Context, task string, sessionCfg map[string]string, 
 
 	tctx := tcontext.NewContext(ctx, log.With(zap.String("component", "schema-tracker"), zap.String("task", task)))
 	// get variables if user doesn't specify
-	// all cfg in sessionVars should be lower case
-	for _, k := range sessionVars {
+	// all cfg in downstreamVars should be lower case
+	for _, k := range downstreamVars {
 		if _, ok := sessionCfg[k]; !ok {
 			var ignoredColumn interface{}
 			rows, err2 := tidbConn.QuerySQL(tctx, fmt.Sprintf("SHOW VARIABLES LIKE '%s'", k))
@@ -86,6 +94,7 @@ func NewTracker(ctx context.Context, task string, sessionCfg map[string]string, 
 				}
 				sessionCfg[k] = value
 			}
+			// nolint:sqlclosecheck
 			if err2 = rows.Close(); err2 != nil {
 				return nil, err2
 			}
@@ -113,7 +122,21 @@ func NewTracker(ctx context.Context, task string, sessionCfg map[string]string, 
 		return nil, err
 	}
 
+	globalVarsToSet := make(map[string]string, len(defaultGlobalVars))
+	for k, v := range defaultGlobalVars {
+		// user's config has highest priority
+		if _, ok := sessionCfg[k]; !ok {
+			globalVarsToSet[k] = v
+		}
+	}
+
 	for k, v := range sessionCfg {
+		err = se.GetSessionVars().SetSystemVar(k, v)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for k, v := range globalVarsToSet {
 		err = se.GetSessionVars().SetSystemVar(k, v)
 		if err != nil {
 			return nil, err
@@ -161,6 +184,7 @@ func (tr *Tracker) GetCreateTable(ctx context.Context, db, table string) (string
 	} else if len(rs) != 1 {
 		return "", nil // this should not happen.
 	}
+	// nolint:errcheck
 	defer rs[0].Close()
 
 	req := rs[0].NewChunk()
@@ -240,7 +264,7 @@ func (tr *Tracker) Reset() error {
 	return nil
 }
 
-// Close close a tracker
+// Close close a tracker.
 func (tr *Tracker) Close() error {
 	tr.se.Close()
 	tr.dom.Close()
@@ -281,87 +305,14 @@ func cloneTableInfo(ti *model.TableInfo) *model.TableInfo {
 
 // CreateTableIfNotExists creates a TABLE of the given name if it did not exist.
 func (tr *Tracker) CreateTableIfNotExists(db, table string, ti *model.TableInfo) error {
-	infoSchema := tr.dom.InfoSchema()
 	dbName := model.NewCIStr(db)
 	tableName := model.NewCIStr(table)
-	if infoSchema.TableExists(dbName, tableName) {
-		return nil
-	}
+	ti = cloneTableInfo(ti)
+	ti.Name = tableName
+	return tr.dom.DDL().CreateTableWithInfo(tr.se, dbName, ti, ddl.OnExistIgnore, false)
+}
 
-	dbInfo, exists := infoSchema.SchemaByName(dbName)
-	if !exists || dbInfo == nil {
-		return infoschema.ErrDatabaseNotExists.GenWithStackByArgs(dbName)
-	}
-
-	// we need to go through the low-level DDL Job API since we don't have a way
-	// to recover a CreateTableStmt from a TableInfo yet.
-
-	// First enqueue the DDL job.
-	var (
-		jobID int64
-		ctx   = context.Background()
-	)
-	err := kv.RunInNewTxn(ctx, tr.store, true /*retryable*/, func(_ context.Context, txn kv.Transaction) error {
-		// reallocate IDs
-		idsCount := 2
-		if ti.Partition != nil {
-			idsCount += len(ti.Partition.Definitions)
-		}
-		m := meta.NewMeta(txn)
-		ids, err := m.GenGlobalIDs(idsCount)
-		if err != nil {
-			return err
-		}
-
-		jobID = ids[0]
-		tableInfo := cloneTableInfo(ti)
-		tableInfo.ID = ids[1]
-		tableInfo.Name = tableName
-		if tableInfo.Partition != nil {
-			for i := range tableInfo.Partition.Definitions {
-				tableInfo.Partition.Definitions[i].ID = ids[i+2]
-			}
-		}
-
-		return m.EnQueueDDLJob(&model.Job{
-			ID:         jobID,
-			Type:       model.ActionCreateTable,
-			SchemaID:   dbInfo.ID,
-			TableID:    tableInfo.ID,
-			SchemaName: dbName.O,
-			Version:    1,
-			StartTS:    txn.StartTS(),
-			BinlogInfo: &model.HistoryInfo{},
-			Args:       []interface{}{tableInfo},
-		})
-	})
-	if err != nil {
-		return err
-	}
-
-	// Then wait until the DDL job is synchronized (should take 2 * lease)
-	lease := tr.dom.DDL().GetLease() * 2
-	for i := 0; i < waitDDLRetryCount; i++ {
-		var job *model.Job
-		err = kv.RunInNewTxn(ctx, tr.store, false /*retryable*/, func(_ context.Context, txn kv.Transaction) error {
-			m := meta.NewMeta(txn)
-			var e error
-			job, e = m.GetHistoryDDLJob(jobID)
-			return e
-		})
-		if err == nil && job != nil {
-			if job.IsSynced() {
-				return nil
-			}
-			if job.Error != nil {
-				return job.Error
-			}
-		}
-		time.Sleep(lease)
-	}
-	if err == nil {
-		// reaching here is basically a bug.
-		return errors.Errorf("Cannot create table %s.%s, the DDL job never returned", db, table)
-	}
-	return err
+// GetSystemVar gets a variable from schema tracker.
+func (tr *Tracker) GetSystemVar(name string) (string, bool) {
+	return tr.se.GetSessionVars().GetSystemVar(name)
 }

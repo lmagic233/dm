@@ -7,8 +7,10 @@ LDFLAGS += -X "github.com/pingcap/dm/pkg/utils.GoVersion=$(shell go version)"
 CURDIR   := $(shell pwd)
 GO       := GO111MODULE=on go
 GOBUILD  := CGO_ENABLED=0 $(GO) build
-GOTEST   := CGO_ENABLED=1 $(GO) test
+GOTEST   := CGO_ENABLED=1 $(GO) test -gcflags="all=-N -l"
+PACKAGE_NAME := github.com/pingcap/dm
 PACKAGES  := $$(go list ./... | grep -vE 'tests|cmd|vendor|pb|pbmock|_tools')
+PACKAGE_DIRECTORIES := $$(echo "$(PACKAGES)" | sed 's/github.com\/pingcap\/dm\/*//')
 PACKAGES_RELAY := $$(go list ./... | grep 'github.com/pingcap/dm/relay')
 PACKAGES_SYNCER := $$(go list ./... | grep 'github.com/pingcap/dm/syncer')
 PACKAGES_PKG_BINLOG := $$(go list ./... | grep 'github.com/pingcap/dm/pkg/binlog')
@@ -80,15 +82,7 @@ dm-portal-frontend:
 
 tools_setup:
 	@echo "setup tools"
-	cd tools && $(GOBUILD) -o bin/errcheck github.com/kisielk/errcheck
-	cd tools && $(GOBUILD) -o bin/failpoint-ctl github.com/pingcap/failpoint/failpoint-ctl
-	cd tools && $(GOBUILD) -o bin/gocovmerge github.com/zhouqiang-cl/gocovmerge
-	cd tools && $(GOBUILD) -o bin/golint golang.org/x/lint/golint
-	cd tools && $(GOBUILD) -o bin/goveralls github.com/mattn/goveralls
-	cd tools && $(GOBUILD) -o bin/mockgen github.com/golang/mock/mockgen
-	cd tools && $(GOBUILD) -o bin/protoc-gen-gogofaster github.com/gogo/protobuf/protoc-gen-gogofaster
-	cd tools && $(GOBUILD) -o bin/protoc-gen-grpc-gateway github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway
-	cd tools && $(GOBUILD) -o bin/statik github.com/rakyll/statik
+	@cd tools && make
 
 generate_proto: tools_setup
 	./generate-dm.sh
@@ -104,7 +98,7 @@ define run_unit_test
 	mkdir -p $(TEST_DIR)
 	$(FAILPOINT_ENABLE)
 	@export log_level=error; \
-	$(GOTEST) -covermode=atomic -coverprofile="$(TEST_DIR)/cov.$(2).out" $(TEST_RACE_FLAG) $(1) \
+	$(GOTEST)  -timeout 2m -covermode=atomic -coverprofile="$(TEST_DIR)/cov.$(2).out" $(TEST_RACE_FLAG) $(1) \
 	|| { $(FAILPOINT_DISABLE); exit 1; }
 	$(FAILPOINT_DISABLE)
 endef
@@ -128,25 +122,25 @@ unit_test_pkg_binlog: tools_setup
 unit_test_others: tools_setup
 	$(call run_unit_test,$(PACKAGES_OTHERS),unit_test_others)
 
-check: tools_setup fmt lint vet terror_check tidy_mod
+check: tools_setup lint fmt terror_check tidy_mod
 
-fmt:
-	@echo "gofmt (simplify)"
-	@ gofmt -s -l -w $(FILES) 2>&1 | awk '{print} END{if(NR>0) {exit 1}}'
-
-errcheck: tools_setup
-	@echo "errcheck"
-	tools/bin/errcheck -blank $(PACKAGES) | grep -v "_test\.go" | awk '{print} END{if(NR>0) {exit 1}}'
+fmt: tools_setup
+	@if [[ "${nolint}" != "true" ]]; then\
+		echo "shfmt"; \
+		tools/bin/shfmt -l -w -d "tests/" ; \
+		echo "gofumports"; \
+		tools/bin/gofumports -w -d -local $(PACKAGE_NAME) $(PACKAGE_DIRECTORIES) 2>&1 | awk "{print} END{if(NR>0) {exit 1}}" ;\
+		echo "golangci-lint"; \
+		tools/bin/golangci-lint run --config=$(CURDIR)/.golangci.yml --fix --issues-exit-code=1 $(PACKAGE_DIRECTORIES) ;\
+	fi
 
 lint: tools_setup
-	@echo "golint"
-	tools/bin/golint -set_exit_status $(PACKAGES)
-
-vet:
-	$(GO) build -o bin/shadow golang.org/x/tools/go/analysis/passes/shadow/cmd/shadow
-	@echo "vet"
-	@$(GO) vet -composites=false $(PACKAGES)
-	@$(GO) vet -vettool=$(CURDIR)/bin/shadow $(PACKAGES) || true
+	@if [[ "${nolint}" != "true" ]]; then\
+		echo "golangci-lint"; \
+		tools/bin/golangci-lint run --config=$(CURDIR)/.golangci.yml --issues-exit-code=1 $(PACKAGE_DIRECTORIES); \
+		echo "run shfmt"; \
+		tools/bin/shfmt -d "tests/"; \
+	fi
 
 terror_check:
 	@echo "check terror conflict"
@@ -154,7 +148,8 @@ terror_check:
 
 tidy_mod:
 	@echo "tidy go.mod"
-	_utils/mod_check/check.sh
+	$(GO) mod tidy
+	git diff --exit-code go.mod go.sum
 
 dm_integration_test_build: tools_setup
 	$(FAILPOINT_ENABLE)
@@ -173,6 +168,15 @@ dm_integration_test_build: tools_setup
 	$(GOTEST) -ldflags '$(LDFLAGS)' -c $(TEST_RACE_FLAG) -cover -covermode=atomic \
 		-coverpkg=github.com/pingcap/dm/... \
 		-o bin/dm-syncer.test github.com/pingcap/dm/cmd/dm-syncer \
+		|| { $(FAILPOINT_DISABLE); exit 1; }
+	$(FAILPOINT_DISABLE)
+	tests/prepare_tools.sh
+
+dm_integration_test_build_worker: tools_setup
+	$(FAILPOINT_ENABLE)
+	$(GOTEST) -ldflags '$(LDFLAGS)' -c $(TEST_RACE_FLAG) -cover -covermode=atomic \
+		-coverpkg=github.com/pingcap/dm/... \
+		-o bin/dm-worker.test github.com/pingcap/dm/cmd/dm-worker \
 		|| { $(FAILPOINT_DISABLE); exit 1; }
 	$(FAILPOINT_DISABLE)
 	tests/prepare_tools.sh
@@ -208,14 +212,6 @@ else
 	go tool cover -html "$(TEST_DIR)/all_cov.out" -o "$(TEST_DIR)/all_cov.html"
 	go tool cover -html "$(TEST_DIR)/unit_test.out" -o "$(TEST_DIR)/unit_test_cov.html"
 endif
-
-check-static:
-	@echo "gometalinter"
-	gometalinter --disable-all --deadline 120s \
-	  --enable misspell \
-	  --enable megacheck \
-	  --enable ineffassign \
-	  ./...
 
 failpoint-enable: tools_setup
 	$(FAILPOINT_ENABLE)

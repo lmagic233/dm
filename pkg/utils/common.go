@@ -19,16 +19,24 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
-
-	"github.com/pingcap/dm/pkg/log"
-	"github.com/pingcap/dm/pkg/terror"
+	"sync"
+	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/parser/model"
 	tmysql "github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb-tools/pkg/dbutil"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	router "github.com/pingcap/tidb-tools/pkg/table-router"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/tidb/types"
+	"github.com/shopspring/decimal"
 	"go.uber.org/zap"
+
+	"github.com/pingcap/dm/pkg/log"
+	"github.com/pingcap/dm/pkg/terror"
 )
 
 // TrimCtrlChars returns a slice of the string s with all leading
@@ -45,7 +53,7 @@ func TrimCtrlChars(s string) string {
 }
 
 // TrimQuoteMark tries to trim leading and tailing quote(") mark if exists
-// only trim if leading and tailing quote matched as a pair
+// only trim if leading and tailing quote matched as a pair.
 func TrimQuoteMark(s string) string {
 	if len(s) > 2 && s[0] == '"' && s[len(s)-1] == '"' {
 		return s[1 : len(s)-1]
@@ -53,7 +61,7 @@ func TrimQuoteMark(s string) string {
 	return s
 }
 
-// FetchAllDoTables returns all need to do tables after filtered (fetches from upstream MySQL)
+// FetchAllDoTables returns all need to do tables after filtered (fetches from upstream MySQL).
 func FetchAllDoTables(ctx context.Context, db *sql.DB, bw *filter.Filter) (map[string][]string, error) {
 	schemas, err := dbutil.GetSchemas(ctx, db)
 
@@ -112,7 +120,7 @@ func FetchAllDoTables(ctx context.Context, db *sql.DB, bw *filter.Filter) (map[s
 	return schemaToTables, nil
 }
 
-// FetchTargetDoTables returns all need to do tables after filtered and routed (fetches from upstream MySQL)
+// FetchTargetDoTables returns all need to do tables after filtered and routed (fetches from upstream MySQL).
 func FetchTargetDoTables(ctx context.Context, db *sql.DB, bw *filter.Filter, router *router.Table) (map[string][]*filter.Table, error) {
 	// fetch tables from source and filter them
 	sourceTables, err := FetchAllDoTables(ctx, db, bw)
@@ -146,7 +154,7 @@ func FetchTargetDoTables(ctx context.Context, db *sql.DB, bw *filter.Filter, rou
 }
 
 // CompareShardingDDLs compares s and t ddls
-// only concern in content, ignore order of ddl
+// only concern in content, ignore order of ddl.
 func CompareShardingDDLs(s, t []string) bool {
 	if len(s) != len(t) {
 		return false
@@ -166,15 +174,16 @@ func CompareShardingDDLs(s, t []string) bool {
 	return true
 }
 
-// GenDDLLockID returns lock ID used in shard-DDL
+// GenDDLLockID returns lock ID used in shard-DDL.
 func GenDDLLockID(task, schema, table string) string {
 	return fmt.Sprintf("%s-%s", task, dbutil.TableName(schema, table))
 }
 
-// ExtractTaskFromLockID extract task from lockID
+var lockIDPattern = regexp.MustCompile("(.*)\\-\\`(.*)\\`.\\`(.*)\\`")
+
+// ExtractTaskFromLockID extract task from lockID.
 func ExtractTaskFromLockID(lockID string) string {
-	pattern := regexp.MustCompile("(.*)\\-\\`(.*)\\`.\\`(.*)\\`")
-	strs := pattern.FindStringSubmatch(lockID)
+	strs := lockIDPattern.FindStringSubmatch(lockID)
 	// strs should be [full-lock-ID, task, db, table] if successful matched
 	if len(strs) < 4 {
 		return ""
@@ -182,7 +191,17 @@ func ExtractTaskFromLockID(lockID string) string {
 	return strs[1]
 }
 
-// NonRepeatStringsEqual is used to compare two un-ordered, non-repeat-element string slice is equal
+// ExtractDBAndTableFromLockID extract schema and table from lockID.
+func ExtractDBAndTableFromLockID(lockID string) (string, string) {
+	strs := lockIDPattern.FindStringSubmatch(lockID)
+	// strs should be [full-lock-ID, task, db, table] if successful matched
+	if len(strs) < 4 {
+		return "", ""
+	}
+	return strs[2], strs[3]
+}
+
+// NonRepeatStringsEqual is used to compare two un-ordered, non-repeat-element string slice is equal.
 func NonRepeatStringsEqual(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -197,4 +216,80 @@ func NonRepeatStringsEqual(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+type session struct {
+	sessionctx.Context
+	vars   *variable.SessionVars
+	values map[fmt.Stringer]interface{}
+
+	mu sync.RWMutex
+}
+
+// GetSessionVars implements the sessionctx.Context interface.
+func (se *session) GetSessionVars() *variable.SessionVars {
+	return se.vars
+}
+
+// SetValue implements the sessionctx.Context interface.
+func (se *session) SetValue(key fmt.Stringer, value interface{}) {
+	se.mu.Lock()
+	se.values[key] = value
+	se.mu.Unlock()
+}
+
+// Value implements the sessionctx.Context interface.
+func (se *session) Value(key fmt.Stringer) interface{} {
+	se.mu.RLock()
+	value := se.values[key]
+	se.mu.RUnlock()
+	return value
+}
+
+// UTCSession can be used as a sessionctx.Context, with UTC timezone.
+var UTCSession *session
+
+func init() {
+	UTCSession = &session{}
+	vars := variable.NewSessionVars()
+	vars.StmtCtx.TimeZone = time.UTC
+	UTCSession.vars = vars
+	UTCSession.values = make(map[fmt.Stringer]interface{}, 1)
+}
+
+// AdjustBinaryProtocolForDatum converts the data in binlog to TiDB datum.
+func AdjustBinaryProtocolForDatum(data []interface{}, cols []*model.ColumnInfo) ([]types.Datum, error) {
+	log.L().Debug("AdjustBinaryProtocolForChunk",
+		zap.Any("data", data),
+		zap.Any("columns", cols))
+	ret := make([]types.Datum, 0, len(data))
+	for i, d := range data {
+		switch v := d.(type) {
+		case int8:
+			d = int64(v)
+		case int16:
+			d = int64(v)
+		case int32:
+			d = int64(v)
+		case uint8:
+			d = uint64(v)
+		case uint16:
+			d = uint64(v)
+		case uint32:
+			d = uint64(v)
+		case uint:
+			d = uint64(v)
+		case decimal.Decimal:
+			d = v.String()
+		}
+		datum := types.NewDatum(d)
+
+		// TODO: should we use timezone of upstream?
+		castDatum, err := table.CastValue(UTCSession, datum, cols[i], false, false)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, castDatum)
+	}
+	return ret, nil
 }

@@ -15,6 +15,8 @@ package utils
 
 import (
 	"context"
+	"strconv"
+	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/errors"
@@ -22,14 +24,13 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/coreos/go-semver/semver"
+	gmysql "github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/go-sql-driver/mysql"
-	gmysql "github.com/siddontang/go-mysql/mysql"
 )
 
 var _ = Suite(&testDBSuite{})
 
-type testDBSuite struct {
-}
+type testDBSuite struct{}
 
 func (t *testDBSuite) TestGetFlavor(c *C) {
 	db, mock, err := sqlmock.New()
@@ -50,7 +51,7 @@ func (t *testDBSuite) TestGetFlavor(c *C) {
 	c.Assert(mock.ExpectationsWereMet(), IsNil)
 
 	// others
-	mock.ExpectQuery(`SHOW GLOBAL VARIABLES LIKE 'version';`).WillReturnRows(sqlmock.NewRows([]string{"Variable_name", "Value"}).AddRow("version", "unkown"))
+	mock.ExpectQuery(`SHOW GLOBAL VARIABLES LIKE 'version';`).WillReturnRows(sqlmock.NewRows([]string{"Variable_name", "Value"}).AddRow("version", "unknown"))
 	flavor, err = GetFlavor(context.Background(), db)
 	c.Assert(err, IsNil)
 	c.Assert(flavor, Equals, "mysql") // as MySQL
@@ -124,6 +125,14 @@ func (t *testDBSuite) TestGetMasterStatus(c *C) {
 	})
 	c.Assert(gs.String(), Equals, "1-2-100")
 	c.Assert(mock.ExpectationsWereMet(), IsNil)
+
+	// some upstream (maybe a polarDB secondary node)
+	rows = mock.NewRows([]string{"File", "Position", "Binlog_Do_DB", "Binlog_Ignore_DB"})
+	mock.ExpectQuery(`SHOW MASTER STATUS`).WillReturnRows(rows)
+
+	_, gs, err = GetMasterStatus(ctx, db, "mysql")
+	c.Assert(gs, IsNil)
+	c.Assert(err, NotNil)
 }
 
 func (t *testDBSuite) TestGetMariaDBGtidDomainID(c *C) {
@@ -165,6 +174,22 @@ func (t *testDBSuite) TestGetServerUUID(c *C) {
 	uuid, err = GetServerUUID(ctx, db, "mariadb")
 	c.Assert(err, IsNil)
 	c.Assert(uuid, Equals, "123-456")
+	c.Assert(mock.ExpectationsWereMet(), IsNil)
+}
+
+func (t *testDBSuite) TestGetServerUnixTS(c *C) {
+	ctx := context.Background()
+
+	db, mock, err := sqlmock.New()
+	c.Assert(err, IsNil)
+
+	ts := time.Now().Unix()
+	rows := sqlmock.NewRows([]string{"UNIX_TIMESTAMP()"}).AddRow(strconv.FormatInt(ts, 10))
+	mock.ExpectQuery("SELECT UNIX_TIMESTAMP()").WillReturnRows(rows)
+
+	ts2, err := GetServerUnixTS(ctx, db)
+	c.Assert(err, IsNil)
+	c.Assert(ts, Equals, ts2)
 	c.Assert(mock.ExpectationsWereMet(), IsNil)
 }
 
@@ -286,7 +311,6 @@ func (t *testDBSuite) createMockResult(mock sqlmock.Sqlmock, masterID uint32, se
 			rows.AddRow(serverID, host, port, masterID)
 		}
 		expectQuery.WillReturnRows(rows)
-
 	} else {
 		rows := sqlmock.NewRows([]string{"Server_id", "Host", "Port", "Master_id", "Slave_UUID"})
 		for _, serverID := range serverIDs {

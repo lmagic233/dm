@@ -16,7 +16,7 @@ See [Step by Step Contribute Example](step_by_step_contribute.md) for a more det
 
 Developing DM requires:
 
-* [Go 1.13+](http://golang.org/doc/code.html)
+* [Go 1.16+](http://golang.org/doc/code.html)
 * An internet connection to download the dependencies
 
 Simply run `make` to build the program.
@@ -38,7 +38,7 @@ you also need to install:
 * [protoc 3.6+](https://github.com/protocolbuffers/protobuf/releases)
 * [protoc-gen-gogofaster 1.2+](https://github.com/gogo/protobuf#more-speed-and-more-generated-code)
 
-Run `./generate-dm.sh` to regenerate go code files.
+Run `make generate_proto` to regenerate go code files.
 
 ### Updating dependencies
 

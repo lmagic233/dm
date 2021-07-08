@@ -25,16 +25,16 @@ var (
 	// ErrorMsgHeader used as the header of the error message when checking config failed.
 	ErrorMsgHeader = "fail to check synchronization configuration with type"
 
-	// CheckSyncConfigFunc holds the CheckSyncConfig function
-	CheckSyncConfigFunc func(ctx context.Context, cfgs []*config.SubTaskConfig) error
+	// CheckSyncConfigFunc holds the CheckSyncConfig function.
+	CheckSyncConfigFunc func(ctx context.Context, cfgs []*config.SubTaskConfig, errCnt, warnCnt int64) error
 )
 
 func init() {
 	CheckSyncConfigFunc = CheckSyncConfig
 }
 
-// CheckSyncConfig checks synchronization configuration
-func CheckSyncConfig(ctx context.Context, cfgs []*config.SubTaskConfig) error {
+// CheckSyncConfig checks synchronization configuration.
+func CheckSyncConfig(ctx context.Context, cfgs []*config.SubTaskConfig, errCnt, warnCnt int64) error {
 	if len(cfgs) == 0 {
 		return nil
 	}
@@ -56,10 +56,9 @@ func CheckSyncConfig(ctx context.Context, cfgs []*config.SubTaskConfig) error {
 		return nil
 	}
 
-	c := NewChecker(cfgs, checkingItems)
+	c := NewChecker(cfgs, checkingItems, errCnt, warnCnt)
 
-	err := c.Init(ctx)
-	if err != nil {
+	if err := c.Init(ctx); err != nil {
 		return terror.Annotate(err, "fail to initial checker")
 	}
 	defer c.Close()

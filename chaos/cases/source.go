@@ -19,6 +19,7 @@ import (
 	"io/ioutil"
 	"path/filepath"
 	"strings"
+	"time"
 
 	config2 "github.com/pingcap/dm/dm/config"
 	"github.com/pingcap/dm/dm/pb"
@@ -44,16 +45,16 @@ func createSources(ctx context.Context, cli pb.MasterClient, cfg *config) error 
 		return err
 	}
 
-	cfg1 := config2.NewSourceConfig()
-	cfg2 := config2.NewSourceConfig()
-	cfg3 := config2.NewSourceConfig()
-	if err = cfg1.ParseYaml(string(s1Content)); err != nil {
+	cfg1, err := config2.ParseYaml(string(s1Content))
+	if err != nil {
 		return err
 	}
-	if err = cfg2.ParseYaml(string(s2Content)); err != nil {
+	cfg2, err := config2.ParseYaml(string(s2Content))
+	if err != nil {
 		return err
 	}
-	if err = cfg3.ParseYaml(string(s3Content)); err != nil {
+	cfg3, err := config2.ParseYaml(string(s3Content))
+	if err != nil {
 		return err
 	}
 
@@ -61,6 +62,12 @@ func createSources(ctx context.Context, cli pb.MasterClient, cfg *config) error 
 	cfg1.From = cfg.Source1
 	cfg2.From = cfg.Source2
 	cfg3.From = cfg.Source3
+
+	// reduce backoffmax for autoresume
+	cfg1.Checker.BackoffMax = config2.Duration{Duration: 5 * time.Second}
+	cfg2.Checker.BackoffMax = config2.Duration{Duration: 5 * time.Second}
+	cfg3.Checker.BackoffMax = config2.Duration{Duration: 5 * time.Second}
+
 	s1Content2, err := cfg1.Yaml()
 	if err != nil {
 		return err

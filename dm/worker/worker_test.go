@@ -16,7 +16,10 @@ package worker
 import (
 	"context"
 	"fmt"
+	"os"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	. "github.com/pingcap/check"
@@ -42,35 +45,53 @@ func (t *testServer) testWorker(c *C) {
 	cfg.RelayDir = dir
 	cfg.MetaDir = dir
 
+	var (
+		masterAddr   = tempurl.Alloc()[len("http://"):]
+		keepAliveTTL = int64(1)
+	)
+	etcdDir := c.MkDir()
+	ETCD, err := createMockETCD(etcdDir, "http://"+masterAddr)
+	c.Assert(err, IsNil)
+	defer ETCD.Close()
+	workerCfg := NewConfig()
+	c.Assert(workerCfg.Parse([]string{"-config=./dm-worker.toml"}), IsNil)
+	workerCfg.Join = masterAddr
+	workerCfg.KeepAliveTTL = keepAliveTTL
+	workerCfg.RelayKeepAliveTTL = keepAliveTTL
+
+	etcdCli, err := clientv3.New(clientv3.Config{
+		Endpoints:            GetJoinURLs(workerCfg.Join),
+		DialTimeout:          dialTimeout,
+		DialKeepAliveTime:    keepaliveTime,
+		DialKeepAliveTimeout: keepaliveTimeout,
+	})
+	c.Assert(err, IsNil)
+
 	NewRelayHolder = NewDummyRelayHolderWithInitError
 	defer func() {
 		NewRelayHolder = NewRealRelayHolder
 	}()
-
-	_, err := NewWorker(&cfg, nil, "")
-	c.Assert(err, ErrorMatches, "init error")
+	w, err := NewWorker(cfg, etcdCli, "")
+	c.Assert(err, IsNil)
+	c.Assert(w.EnableRelay(), ErrorMatches, "init error")
 
 	NewRelayHolder = NewDummyRelayHolder
-	w, err := NewWorker(&cfg, nil, "")
+	w, err = NewWorker(cfg, etcdCli, "")
 	c.Assert(err, IsNil)
-	c.Assert(w.StatusJSON(context.Background(), ""), HasLen, emptyWorkerStatusInfoJSONLength)
-	//c.Assert(w.closed.Get(), Equals, closedFalse)
-	//go func() {
-	//	w.Start()
-	//}()
+	c.Assert(w.StatusJSON(""), HasLen, emptyWorkerStatusInfoJSONLength)
 
 	// close twice
 	w.Close()
-	c.Assert(w.closed.Get(), Equals, closedTrue)
+	c.Assert(w.closed.Load(), IsTrue)
 	c.Assert(w.subTaskHolder.getAllSubTasks(), HasLen, 0)
 	w.Close()
-	c.Assert(w.closed.Get(), Equals, closedTrue)
+	c.Assert(w.closed.Load(), IsTrue)
 	c.Assert(w.subTaskHolder.getAllSubTasks(), HasLen, 0)
-	c.Assert(w.closed.Get(), Equals, closedTrue)
+	c.Assert(w.closed.Load(), IsTrue)
 
 	c.Assert(w.StartSubTask(&config.SubTaskConfig{
 		Name: "testStartTask",
-	}, pb.Stage_Running), IsNil)
+	}, pb.Stage_Running, true), IsNil)
 	task := w.subTaskHolder.findSubTask("testStartTask")
 	c.Assert(task, NotNil)
 	c.Assert(task.Result().String(), Matches, ".*worker already closed.*")
@@ -104,7 +125,7 @@ func (t *testServer2) TestTaskAutoResume(c *C) {
 		taskName = "sub-task-name"
 		port     = 8263
 	)
-	hostName := "127.0.0.1:8261"
+	hostName := "127.0.0.1:18261"
 	etcdDir := c.MkDir()
 	ETCD, err := createMockETCD(etcdDir, "http://"+hostName)
 	c.Assert(err, IsNil)
@@ -112,6 +133,7 @@ func (t *testServer2) TestTaskAutoResume(c *C) {
 
 	cfg := NewConfig()
 	c.Assert(cfg.Parse([]string{"-config=./dm-worker.toml"}), IsNil)
+	cfg.Join = hostName
 	sourceConfig := loadSourceConfigWithoutPassword(c)
 	sourceConfig.Checker.CheckEnable = true
 	sourceConfig.Checker.CheckInterval = config.Duration{Duration: 40 * time.Millisecond}
@@ -150,21 +172,26 @@ func (t *testServer2) TestTaskAutoResume(c *C) {
 		c.Assert(s.Start(), IsNil)
 	}()
 	c.Assert(utils.WaitSomething(10, 100*time.Millisecond, func() bool {
-		if s.closed.Get() {
+		if s.closed.Load() {
 			return false
 		}
-		c.Assert(s.startWorker(&sourceConfig), IsNil)
+		w, err2 := s.getOrStartWorker(sourceConfig, true)
+		c.Assert(err2, IsNil)
+		// we set sourceConfig.EnableRelay = true above
+		c.Assert(w.EnableRelay(), IsNil)
+		c.Assert(w.EnableHandleSubtasks(), IsNil)
 		return true
 	}), IsTrue)
 	// start task
 	var subtaskCfg config.SubTaskConfig
 	c.Assert(subtaskCfg.DecodeFile("./subtask.toml", true), IsNil)
 	c.Assert(err, IsNil)
-	c.Assert(s.getWorker(true).StartSubTask(&subtaskCfg, pb.Stage_Running), IsNil)
+	c.Assert(s.getWorker(true).StartSubTask(&subtaskCfg, pb.Stage_Running, true), IsNil)
 
 	// check task in paused state
 	c.Assert(utils.WaitSomething(100, 100*time.Millisecond, func() bool {
-		for _, st := range s.getWorker(true).QueryStatus(context.Background(), taskName) {
+		subtaskStatus, _, _ := s.getWorker(true).QueryStatus(context.Background(), taskName)
+		for _, st := range subtaskStatus {
 			if st.Name == taskName && st.Stage == pb.Stage_Paused {
 				return true
 			}
@@ -184,7 +211,7 @@ func (t *testServer2) TestTaskAutoResume(c *C) {
 
 	// check task will be auto resumed
 	c.Assert(utils.WaitSomething(10, 100*time.Millisecond, func() bool {
-		sts := s.getWorker(true).QueryStatus(context.Background(), taskName)
+		sts, _, _ := s.getWorker(true).QueryStatus(context.Background(), taskName)
 		for _, st := range sts {
 			if st.Name == taskName && st.Stage == pb.Stage_Running {
 				return true
@@ -195,17 +222,190 @@ func (t *testServer2) TestTaskAutoResume(c *C) {
 	}), IsTrue)
 }
 
+type testWorkerFunctionalities struct {
+	createUnitCount         int32
+	expectedCreateUnitCount int32
+}
+
+var _ = Suite(&testWorkerFunctionalities{})
+
+func (t *testWorkerFunctionalities) SetUpSuite(c *C) {
+	NewRelayHolder = NewDummyRelayHolder
+	NewSubTask = NewRealSubTask
+	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) []unit.Unit {
+		atomic.AddInt32(&t.createUnitCount, 1)
+		mockDumper := NewMockUnit(pb.UnitType_Dump)
+		mockLoader := NewMockUnit(pb.UnitType_Load)
+		mockSync := NewMockUnit(pb.UnitType_Sync)
+		return []unit.Unit{mockDumper, mockLoader, mockSync}
+	}
+	getMinLocForSubTaskFunc = getFakeLocForSubTask
+}
+
+func (t *testWorkerFunctionalities) TearDownSuite(c *C) {
+	NewRelayHolder = NewRealRelayHolder
+	NewSubTask = NewRealSubTask
+	createUnits = createRealUnits
+	getMinLocForSubTaskFunc = getMinLocForSubTask
+}
+
+func (t *testWorkerFunctionalities) TestWorkerFunctionalities(c *C) {
+	var (
+		masterAddr   = tempurl.Alloc()[len("http://"):]
+		keepAliveTTL = int64(1)
+	)
+	etcdDir := c.MkDir()
+	ETCD, err := createMockETCD(etcdDir, "http://"+masterAddr)
+	c.Assert(err, IsNil)
+	defer ETCD.Close()
+	cfg := NewConfig()
+	c.Assert(cfg.Parse([]string{"-config=./dm-worker.toml"}), IsNil)
+	cfg.Join = masterAddr
+	cfg.KeepAliveTTL = keepAliveTTL
+	cfg.RelayKeepAliveTTL = keepAliveTTL
+
+	etcdCli, err := clientv3.New(clientv3.Config{
+		Endpoints:            GetJoinURLs(cfg.Join),
+		DialTimeout:          dialTimeout,
+		DialKeepAliveTime:    keepaliveTime,
+		DialKeepAliveTimeout: keepaliveTimeout,
+	})
+	c.Assert(err, IsNil)
+	sourceCfg := loadSourceConfigWithoutPassword(c)
+	sourceCfg.EnableRelay = false
+
+	subtaskCfg := config.SubTaskConfig{}
+	err = subtaskCfg.DecodeFile(subtaskSampleFile, true)
+	c.Assert(err, IsNil)
+
+	// start worker
+	w, err := NewWorker(sourceCfg, etcdCli, "")
+	c.Assert(err, IsNil)
+	defer w.Close()
+	go func() {
+		w.Start()
+	}()
+	c.Assert(utils.WaitSomething(50, 100*time.Millisecond, func() bool {
+		return !w.closed.Load()
+	}), IsTrue)
+
+	// test 1: when subTaskEnabled is false, switch on relay
+	c.Assert(w.subTaskEnabled.Load(), IsFalse)
+	t.testEnableRelay(c, w, etcdCli, sourceCfg, cfg)
+
+	// test2: when subTaskEnabled is false, switch off relay
+	c.Assert(w.subTaskEnabled.Load(), IsFalse)
+	t.testDisableRelay(c, w)
+
+	// test3: when relayEnabled is false, switch on subtask
+	c.Assert(w.relayEnabled.Load(), IsFalse)
+
+	t.testEnableHandleSubtasks(c, w, etcdCli, subtaskCfg, sourceCfg)
+
+	// test4: when subTaskEnabled is true, switch on relay
+	c.Assert(w.subTaskEnabled.Load(), IsTrue)
+
+	t.testEnableRelay(c, w, etcdCli, sourceCfg, cfg)
+	c.Assert(w.subTaskHolder.findSubTask(subtaskCfg.Name).cfg.UseRelay, IsTrue)
+	t.expectedCreateUnitCount++
+	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
+		return atomic.LoadInt32(&t.createUnitCount) == t.expectedCreateUnitCount
+	}), IsTrue)
+
+	// test5: when subTaskEnabled is true, switch off relay
+	c.Assert(w.subTaskEnabled.Load(), IsTrue)
+	t.testDisableRelay(c, w)
+
+	c.Assert(w.subTaskHolder.findSubTask(subtaskCfg.Name).cfg.UseRelay, IsFalse)
+	t.expectedCreateUnitCount++
+	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
+		return atomic.LoadInt32(&t.createUnitCount) == t.expectedCreateUnitCount
+	}), IsTrue)
+
+	// test6: when relayEnabled is false, switch off subtask
+	c.Assert(w.relayEnabled.Load(), IsFalse)
+
+	w.DisableHandleSubtasks()
+	c.Assert(w.subTaskEnabled.Load(), IsFalse)
+
+	// prepare for test7 & 8
+	t.testEnableRelay(c, w, etcdCli, sourceCfg, cfg)
+	// test7: when relayEnabled is true, switch on subtask
+	c.Assert(w.relayEnabled.Load(), IsTrue)
+
+	subtaskCfg2 := subtaskCfg
+	subtaskCfg2.Name = "sub-task-name-2"
+	// we already added subtaskCfg, so below EnableHandleSubtasks will find an extra subtask
+	t.expectedCreateUnitCount++
+	t.testEnableHandleSubtasks(c, w, etcdCli, subtaskCfg2, sourceCfg)
+	c.Assert(w.subTaskHolder.findSubTask(subtaskCfg.Name).cfg.UseRelay, IsTrue)
+	c.Assert(w.subTaskHolder.findSubTask(subtaskCfg2.Name).cfg.UseRelay, IsTrue)
+
+	// test8: when relayEnabled is true, switch off subtask
+	c.Assert(w.relayEnabled.Load(), IsTrue)
+
+	w.DisableHandleSubtasks()
+	c.Assert(w.subTaskEnabled.Load(), IsFalse)
+}
+
+func (t *testWorkerFunctionalities) testEnableRelay(c *C, w *Worker, etcdCli *clientv3.Client,
+	sourceCfg *config.SourceConfig, cfg *Config) {
+	c.Assert(w.EnableRelay(), IsNil)
+
+	c.Assert(w.relayEnabled.Load(), IsTrue)
+	c.Assert(w.relayHolder.Stage(), Equals, pb.Stage_New)
+
+	_, err := ha.PutSourceCfg(etcdCli, sourceCfg)
+	c.Assert(err, IsNil)
+	_, err = ha.PutRelayStageRelayConfigSourceBound(etcdCli, ha.NewRelayStage(pb.Stage_Running, sourceCfg.SourceID),
+		ha.NewSourceBound(sourceCfg.SourceID, cfg.Name))
+	c.Assert(err, IsNil)
+	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
+		return w.relayHolder.Stage() == pb.Stage_Running
+	}), IsTrue)
+
+	_, err = ha.DeleteSourceCfgRelayStageSourceBound(etcdCli, sourceCfg.SourceID, cfg.Name)
+	c.Assert(err, IsNil)
+	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
+		return w.relayHolder.Stage() == pb.Stage_Stopped
+	}), IsTrue)
+}
+
+func (t *testWorkerFunctionalities) testDisableRelay(c *C, w *Worker) {
+	w.DisableRelay()
+
+	c.Assert(w.relayEnabled.Load(), IsFalse)
+	c.Assert(w.relayHolder, IsNil)
+}
+
+func (t *testWorkerFunctionalities) testEnableHandleSubtasks(c *C, w *Worker, etcdCli *clientv3.Client,
+	subtaskCfg config.SubTaskConfig, sourceCfg *config.SourceConfig) {
+	c.Assert(w.EnableHandleSubtasks(), IsNil)
+	c.Assert(w.subTaskEnabled.Load(), IsTrue)
+
+	_, err := ha.PutSubTaskCfgStage(etcdCli, []config.SubTaskConfig{subtaskCfg},
+		[]ha.Stage{ha.NewSubTaskStage(pb.Stage_Running, sourceCfg.SourceID, subtaskCfg.Name)})
+	c.Assert(err, IsNil)
+	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
+		return w.subTaskHolder.findSubTask(subtaskCfg.Name) != nil
+	}), IsTrue)
+	t.expectedCreateUnitCount++
+	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
+		return atomic.LoadInt32(&t.createUnitCount) == t.expectedCreateUnitCount
+	}), IsTrue)
+}
+
 type testWorkerEtcdCompact struct{}
 
 var _ = Suite(&testWorkerEtcdCompact{})
 
 func (t *testWorkerEtcdCompact) SetUpSuite(c *C) {
 	NewRelayHolder = NewDummyRelayHolder
-	NewSubTask = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) *SubTask {
+	NewSubTask = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) *SubTask {
 		cfg.UseRelay = false
-		return NewRealSubTask(cfg, etcdClient)
+		return NewRealSubTask(cfg, etcdClient, worker)
 	}
-	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []unit.Unit {
+	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) []unit.Unit {
 		mockDumper := NewMockUnit(pb.UnitType_Dump)
 		mockLoader := NewMockUnit(pb.UnitType_Load)
 		mockSync := NewMockUnit(pb.UnitType_Sync)
@@ -217,6 +417,28 @@ func (t *testWorkerEtcdCompact) TearDownSuite(c *C) {
 	NewRelayHolder = NewRealRelayHolder
 	NewSubTask = NewRealSubTask
 	createUnits = createRealUnits
+}
+
+func getDBConfigFromEnv() config.DBConfig {
+	host := os.Getenv("MYSQL_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	port, _ := strconv.Atoi(os.Getenv("MYSQL_PORT"))
+	if port == 0 {
+		port = 3306
+	}
+	user := os.Getenv("MYSQL_USER")
+	if user == "" {
+		user = "root"
+	}
+	pswd := os.Getenv("MYSQL_PSWD")
+	return config.DBConfig{
+		Host:     host,
+		User:     user,
+		Password: pswd,
+		Port:     port,
+	}
 }
 
 func (t *testWorkerEtcdCompact) TestWatchSubtaskStageEtcdCompact(c *C) {
@@ -243,19 +465,20 @@ func (t *testWorkerEtcdCompact) TestWatchSubtaskStageEtcdCompact(c *C) {
 	})
 	c.Assert(err, IsNil)
 	sourceCfg := loadSourceConfigWithoutPassword(c)
+	sourceCfg.From = getDBConfigFromEnv()
 	sourceCfg.EnableRelay = false
 
 	// step 1: start worker
-	w, err := NewWorker(&sourceCfg, etcdCli, "")
+	w, err := NewWorker(sourceCfg, etcdCli, "")
 	c.Assert(err, IsNil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer w.Close()
 	go func() {
-		w.Start(false)
+		w.Start()
 	}()
 	c.Assert(utils.WaitSomething(50, 100*time.Millisecond, func() bool {
-		return w.closed.Get() == closedFalse
+		return !w.closed.Load()
 	}), IsTrue)
 	// step 2: Put a subtask config and subtask stage to this source, then delete it
 	subtaskCfg := config.SubTaskConfig{}
@@ -270,7 +493,7 @@ func (t *testWorkerEtcdCompact) TestWatchSubtaskStageEtcdCompact(c *C) {
 		[]ha.Stage{ha.NewSubTaskStage(pb.Stage_Stopped, sourceCfg.SourceID, subtaskCfg.Name)})
 	c.Assert(err, IsNil)
 	// step 2.1: start a subtask manually
-	c.Assert(w.StartSubTask(&subtaskCfg, pb.Stage_Running), IsNil)
+	c.Assert(w.StartSubTask(&subtaskCfg, pb.Stage_Running, true), IsNil)
 	// step 3: trigger etcd compaction and check whether we can receive it through watcher
 	_, err = etcdCli.Compact(ctx, rev)
 	c.Assert(err, IsNil)
@@ -304,7 +527,8 @@ func (t *testWorkerEtcdCompact) TestWatchSubtaskStageEtcdCompact(c *C) {
 	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
 		return w.subTaskHolder.findSubTask(subtaskCfg.Name) != nil
 	}), IsTrue)
-	status := w.QueryStatus(ctx1, subtaskCfg.Name)
+	status, _, err := w.QueryStatus(ctx1, subtaskCfg.Name)
+	c.Assert(err, IsNil)
 	c.Assert(status, HasLen, 1)
 	c.Assert(status[0].Name, Equals, subtaskCfg.Name)
 	c.Assert(status[0].Stage, Equals, pb.Stage_Running)
@@ -322,7 +546,8 @@ func (t *testWorkerEtcdCompact) TestWatchSubtaskStageEtcdCompact(c *C) {
 	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
 		return w.subTaskHolder.findSubTask(subtaskCfg.Name) != nil
 	}), IsTrue)
-	status = w.QueryStatus(ctx2, subtaskCfg.Name)
+	status, _, err = w.QueryStatus(ctx2, subtaskCfg.Name)
+	c.Assert(err, IsNil)
 	c.Assert(status, HasLen, 1)
 	c.Assert(status[0].Name, Equals, subtaskCfg.Name)
 	c.Assert(status[0].Stage, Equals, pb.Stage_Running)
@@ -360,33 +585,34 @@ func (t *testWorkerEtcdCompact) TestWatchRelayStageEtcdCompact(c *C) {
 	sourceCfg.MetaDir = c.MkDir()
 
 	// step 1: start worker
-	w, err := NewWorker(&sourceCfg, etcdCli, "")
+	w, err := NewWorker(sourceCfg, etcdCli, "")
 	c.Assert(err, IsNil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer w.Close()
 	go func() {
-		w.Start(true)
+		c.Assert(w.EnableRelay(), IsNil)
+		w.Start()
 	}()
 	c.Assert(utils.WaitSomething(50, 100*time.Millisecond, func() bool {
-		return w.closed.Get() == closedFalse
+		return !w.closed.Load()
 	}), IsTrue)
 	// step 2: Put a relay stage to this source, then delete it
 	// put mysql config into relative etcd key adapter to trigger operation event
 	c.Assert(w.relayHolder, NotNil)
 	_, err = ha.PutSourceCfg(etcdCli, sourceCfg)
 	c.Assert(err, IsNil)
-	_, err = ha.PutRelayStageSourceBound(etcdCli, ha.NewRelayStage(pb.Stage_Running, sourceCfg.SourceID),
+	rev, err := ha.PutRelayStageRelayConfigSourceBound(etcdCli, ha.NewRelayStage(pb.Stage_Running, sourceCfg.SourceID),
 		ha.NewSourceBound(sourceCfg.SourceID, cfg.Name))
-	c.Assert(err, IsNil)
-	rev, err := ha.DeleteSourceCfgRelayStageSourceBound(etcdCli, sourceCfg.SourceID, cfg.Name)
 	c.Assert(err, IsNil)
 	// check relay stage, should be running
 	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
 		return w.relayHolder.Stage() == pb.Stage_Running
 	}), IsTrue)
-	// step 3: trigger etcd compaction and check whether we can receive it through watcher
+	// step 3: trigger etcd compaction and check whether we can receive it through watcher, then we delete relay stage
 	_, err = etcdCli.Compact(ctx, rev)
+	c.Assert(err, IsNil)
+	_, err = ha.DeleteSourceCfgRelayStageSourceBound(etcdCli, sourceCfg.SourceID, cfg.Name)
 	c.Assert(err, IsNil)
 	relayStageCh := make(chan ha.Stage, 10)
 	relayErrCh := make(chan error, 10)
@@ -397,19 +623,9 @@ func (t *testWorkerEtcdCompact) TestWatchRelayStageEtcdCompact(c *C) {
 	case <-time.After(300 * time.Millisecond):
 		c.Fatal("fail to get etcd error compacted")
 	}
-	// step 4: watch relay stage from startRev
-	var wg sync.WaitGroup
-	ctx1, cancel1 := context.WithCancel(ctx)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		c.Assert(w.observeRelayStage(ctx1, etcdCli, startRev), IsNil)
-	}()
-	// step 5: should stop the running relay
+	// step 4: should stop the running relay because see deletion after compaction
 	time.Sleep(time.Second)
 	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
 		return w.relayHolder.Stage() == pb.Stage_Stopped
 	}), IsTrue)
-	cancel1()
-	wg.Wait()
 }

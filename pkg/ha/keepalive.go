@@ -29,9 +29,9 @@ import (
 )
 
 var (
-	// CurrentKeepAliveTTL may be assigned to KeepAliveTTL or RelayKeepAliveTTL
-	CurrentKeepAliveTTL int64
-	// KeepAliveUpdateCh is used to notify keepalive TTL changing, in order to let watcher not see a DELETE of old key
+	// currentKeepAliveTTL may be assigned to KeepAliveTTL or RelayKeepAliveTTL.
+	currentKeepAliveTTL int64
+	// KeepAliveUpdateCh is used to notify keepalive TTL changing, in order to let watcher not see a DELETE of old key.
 	KeepAliveUpdateCh = make(chan int64, 10)
 )
 
@@ -84,8 +84,8 @@ func KeepAlive(ctx context.Context, cli *clientv3.Client, workerName string, kee
 	for len(KeepAliveUpdateCh) > 0 {
 		keepAliveTTL = <-KeepAliveUpdateCh
 	}
-	// though in regular routine there's no concurrent KeepAlive, we need to handle tests
-	atomic.StoreInt64(&CurrentKeepAliveTTL, keepAliveTTL)
+	// a test concurrently call KeepAlive though in normal running we don't do that
+	atomic.StoreInt64(&currentKeepAliveTTL, keepAliveTTL)
 
 	k := common.WorkerKeepAliveKeyAdapter.Encode(workerName)
 	workerEventJSON, err := WorkerEvent{
@@ -145,10 +145,16 @@ func KeepAlive(ctx context.Context, cli *clientv3.Client, workerName string, kee
 			keepAliveCancel() // make go vet happy
 			return nil
 		case newTTL := <-KeepAliveUpdateCh:
+			if newTTL == currentKeepAliveTTL {
+				log.L().Info("ignore same keepalive TTL change", zap.Int64("TTL", newTTL))
+				continue
+			}
+
 			// create a new lease with new TTL, and overwrite original KV
 			oldLeaseID := leaseID
 			leaseID, err = grantAndPutKV(k, workerEventJSON, newTTL)
 			if err != nil {
+				log.L().Error("meet error when grantAndPutKV keepalive TTL", zap.Error(err))
 				keepAliveCancel() // make go vet happy
 				return err
 			}
@@ -161,6 +167,7 @@ func KeepAlive(ctx context.Context, cli *clientv3.Client, workerName string, kee
 				keepAliveCancel() // make go vet happy
 				return err
 			}
+			currentKeepAliveTTL = newTTL
 			log.L().Info("dynamically changed keepalive TTL to", zap.Int64("ttl in seconds", newTTL))
 
 			// after new keepalive is succeed, we cancel the old keepalive
@@ -174,7 +181,8 @@ func KeepAlive(ctx context.Context, cli *clientv3.Client, workerName string, kee
 }
 
 // ATTENTION!!! we must ensure cli.Ctx() not done when we are exiting worker
-// Do not set cfg.Context when creating cli or do not cancel this Context or it's parent context
+// Do not set cfg.Context when creating cli or do not cancel this Context or it's parent context.
+// nolint:unparam
 func revokeLease(cli *clientv3.Client, id clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error) {
 	ctx, cancel := context.WithTimeout(cli.Ctx(), etcdutil.DefaultRevokeLeaseTimeout)
 	defer cancel()
@@ -182,7 +190,7 @@ func revokeLease(cli *clientv3.Client, id clientv3.LeaseID) (*clientv3.LeaseRevo
 }
 
 // WatchWorkerEvent watches the online and offline of workers from etcd.
-// this function will output the worker event to evCh, output the error to errCh
+// this function will output the worker event to evCh, output the error to errCh.
 func WatchWorkerEvent(ctx context.Context, cli *clientv3.Client, rev int64, outCh chan<- WorkerEvent, errCh chan<- error) {
 	watcher := clientv3.NewWatcher(cli)
 	ch := watcher.Watch(ctx, common.WorkerKeepAliveKeyAdapter.Path(), clientv3.WithPrefix(), clientv3.WithRev(rev))
@@ -240,7 +248,7 @@ func WatchWorkerEvent(ctx context.Context, cli *clientv3.Client, rev int64, outC
 }
 
 // GetKeepAliveWorkers gets current alive workers,
-// and returns a map{workerName: WorkerEvent}, revision and error
+// and returns a map{workerName: WorkerEvent}, revision and error.
 func GetKeepAliveWorkers(cli *clientv3.Client) (map[string]WorkerEvent, int64, error) {
 	ctx, cancel := context.WithTimeout(cli.Ctx(), etcdutil.DefaultRequestTimeout)
 	defer cancel()

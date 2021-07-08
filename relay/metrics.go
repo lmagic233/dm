@@ -14,8 +14,10 @@
 package relay
 
 import (
+	"context"
 	"time"
 
+	"github.com/pingcap/failpoint"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/pingcap/dm/pkg/log"
@@ -42,7 +44,7 @@ var (
 		}, []string{"node"})
 
 	// split sub directory info from relayLogPosGauge / relayLogFileGauge
-	// to make compare relayLogFileGauge for master / relay more easier
+	// to make compare relayLogFileGauge for master / relay more easier.
 	relaySubDirIndex = metricsproxy.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "dm",
@@ -51,7 +53,7 @@ var (
 			Help:      "current relay sub directory index",
 		}, []string{"node", "uuid"})
 
-	// should alert if available space < 10G
+	// should alert if available space < 10G.
 	relayLogSpaceGauge = metricsproxy.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "dm",
@@ -60,7 +62,7 @@ var (
 			Help:      "the space of storage for relay component",
 		}, []string{"type"}) // type can be 'capacity' and 'available'.
 
-	// should alert
+	// should alert.
 	relayLogDataCorruptionCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "dm",
@@ -87,7 +89,7 @@ var (
 			Buckets:   prometheus.ExponentialBuckets(0.000005, 2, 25),
 		})
 
-	// should alert
+	// should alert.
 	relayLogWriteErrorCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "dm",
@@ -96,7 +98,7 @@ var (
 			Help:      "write relay log error count",
 		})
 
-	// should alert
+	// should alert.
 	binlogReadErrorCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "dm",
@@ -123,7 +125,7 @@ var (
 			Buckets:   prometheus.ExponentialBuckets(0.000005, 2, 25),
 		})
 
-	// should alert
+	// should alert.
 	relayExitWithErrorCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "dm",
@@ -149,22 +151,31 @@ func RegisterMetrics(registry *prometheus.Registry) {
 	registry.MustRegister(relayExitWithErrorCounter)
 }
 
-func reportRelayLogSpaceInBackground(dirpath string) error {
+func reportRelayLogSpaceInBackground(ctx context.Context, dirpath string) error {
 	if len(dirpath) == 0 {
 		return terror.ErrRelayLogDirpathEmpty.Generate()
 	}
 
 	go func() {
-		ticker := time.NewTicker(time.Second * 10)
+		var ticker *time.Ticker
+		ticker = time.NewTicker(time.Second * 10)
+		failpoint.Inject("ReportRelayLogSpaceInBackground", func(val failpoint.Value) {
+			t := val.(int)
+			ticker = time.NewTicker(time.Duration(t) * time.Second)
+		})
 		defer ticker.Stop()
-
-		for range ticker.C {
-			size, err := utils.GetStorageSize(dirpath)
-			if err != nil {
-				log.L().Error("fail to update relay log storage size", log.ShortError(err))
-			} else {
-				relayLogSpaceGauge.WithLabelValues("capacity").Set(float64(size.Capacity))
-				relayLogSpaceGauge.WithLabelValues("available").Set(float64(size.Available))
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				size, err := utils.GetStorageSize(dirpath)
+				if err != nil {
+					log.L().Error("fail to update relay log storage size", log.ShortError(err))
+				} else {
+					relayLogSpaceGauge.WithLabelValues("capacity").Set(float64(size.Capacity))
+					relayLogSpaceGauge.WithLabelValues("available").Set(float64(size.Available))
+				}
 			}
 		}
 	}()

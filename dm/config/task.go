@@ -20,23 +20,22 @@ import (
 	"io/ioutil"
 	"sort"
 	"strings"
-	"time"
 
+	"github.com/coreos/go-semver/semver"
+	"github.com/dustin/go-humanize"
+	"github.com/pingcap/parser"
 	bf "github.com/pingcap/tidb-tools/pkg/binlog-filter"
 	"github.com/pingcap/tidb-tools/pkg/column-mapping"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	router "github.com/pingcap/tidb-tools/pkg/table-router"
+	"go.uber.org/zap"
+	"gopkg.in/yaml.v2"
 
 	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dm/pkg/terror"
-
-	"github.com/coreos/go-semver/semver"
-	"github.com/dustin/go-humanize"
-	"go.uber.org/zap"
-	yaml "gopkg.in/yaml.v2"
 )
 
-// Online DDL Scheme
+// Online DDL Scheme.
 const (
 	GHOST  = "gh-ost"
 	PT     = "pt"
@@ -51,29 +50,31 @@ const (
 	tidbTxnOptimistic = "optimistic"
 )
 
-// default config item values
+// default config item values.
 var (
-	// TaskConfig
+	// TaskConfig.
 	defaultMetaSchema      = "dm_meta"
 	defaultEnableHeartbeat = false
 	defaultIsSharding      = false
 	defaultUpdateInterval  = 1
 	defaultReportInterval  = 10
-	// MydumperConfig
+	// MydumperConfig.
 	defaultMydumperPath  = "./bin/mydumper"
 	defaultThreads       = 4
 	defaultChunkFilesize = "64"
 	defaultSkipTzUTC     = true
-	// LoaderConfig
+	// LoaderConfig.
 	defaultPoolSize = 16
 	defaultDir      = "./dumped_data"
-	// SyncerConfig
+	// SyncerConfig.
 	defaultWorkerCount             = 16
 	defaultBatch                   = 100
 	defaultQueueSize               = 1024 // do not give too large default value to avoid OOM
 	defaultCheckpointFlushInterval = 30   // in seconds
+	// force use UTC time_zone.
+	defaultTimeZone = "+00:00"
 
-	// TargetDBConfig
+	// TargetDBConfig.
 	defaultSessionCfg = []struct {
 		key        string
 		val        string
@@ -85,7 +86,7 @@ var (
 
 // Meta represents binlog's meta pos
 // NOTE: refine to put these config structs into pkgs
-// NOTE: now, syncer does not support GTID mode and which is supported by relay
+// NOTE: now, syncer does not support GTID mode and which is supported by relay.
 type Meta struct {
 	BinLogName string `toml:"binlog-name" yaml:"binlog-name"`
 	BinLogPos  uint32 `toml:"binlog-pos" yaml:"binlog-pos"`
@@ -102,7 +103,7 @@ func (m *Meta) Verify() error {
 	return nil
 }
 
-// MySQLInstance represents a sync config of a MySQL instance
+// MySQLInstance represents a sync config of a MySQL instance.
 type MySQLInstance struct {
 	// it represents a MySQL/MariaDB instance or a replica group
 	SourceID           string   `yaml:"source-id"`
@@ -110,6 +111,7 @@ type MySQLInstance struct {
 	FilterRules        []string `yaml:"filter-rules"`
 	ColumnMappingRules []string `yaml:"column-mapping-rules"`
 	RouteRules         []string `yaml:"route-rules"`
+	ExpressionFilters  []string `yaml:"expression-filters"`
 
 	// black-white-list is deprecated, use block-allow-list instead
 	BWListName string `yaml:"black-white-list"`
@@ -131,7 +133,7 @@ type MySQLInstance struct {
 	SyncerThread int `yaml:"syncer-thread"`
 }
 
-// VerifyAndAdjust does verification on configs, and adjust some configs
+// VerifyAndAdjust does verification on configs, and adjust some configs.
 func (m *MySQLInstance) VerifyAndAdjust() error {
 	if m == nil {
 		return terror.ErrConfigMySQLInstNotFound.Generate()
@@ -162,7 +164,7 @@ func (m *MySQLInstance) VerifyAndAdjust() error {
 	return nil
 }
 
-// MydumperConfig represents mydumper process unit's specific config
+// MydumperConfig represents mydumper process unit's specific config.
 type MydumperConfig struct {
 	MydumperPath  string `yaml:"mydumper-path" toml:"mydumper-path" json:"mydumper-path"`    // mydumper binary path
 	Threads       int    `yaml:"threads" toml:"threads" json:"threads"`                      // -t, --threads
@@ -186,10 +188,10 @@ func defaultMydumperConfig() MydumperConfig {
 	}
 }
 
-// alias to avoid infinite recursion for UnmarshalYAML
+// alias to avoid infinite recursion for UnmarshalYAML.
 type rawMydumperConfig MydumperConfig
 
-// UnmarshalYAML implements Unmarshaler.UnmarshalYAML
+// UnmarshalYAML implements Unmarshaler.UnmarshalYAML.
 func (m *MydumperConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	raw := rawMydumperConfig(defaultMydumperConfig())
 	if err := unmarshal(&raw); err != nil {
@@ -199,7 +201,7 @@ func (m *MydumperConfig) UnmarshalYAML(unmarshal func(interface{}) error) error 
 	return nil
 }
 
-// LoaderConfig represents loader process unit's specific config
+// LoaderConfig represents loader process unit's specific config.
 type LoaderConfig struct {
 	PoolSize int    `yaml:"pool-size" toml:"pool-size" json:"pool-size"`
 	Dir      string `yaml:"dir" toml:"dir" json:"dir"`
@@ -213,10 +215,10 @@ func defaultLoaderConfig() LoaderConfig {
 	}
 }
 
-// alias to avoid infinite recursion for UnmarshalYAML
+// alias to avoid infinite recursion for UnmarshalYAML.
 type rawLoaderConfig LoaderConfig
 
-// UnmarshalYAML implements Unmarshaler.UnmarshalYAML
+// UnmarshalYAML implements Unmarshaler.UnmarshalYAML.
 func (m *LoaderConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	raw := rawLoaderConfig(defaultLoaderConfig())
 	if err := unmarshal(&raw); err != nil {
@@ -226,7 +228,7 @@ func (m *LoaderConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// SyncerConfig represents syncer process unit's specific config
+// SyncerConfig represents syncer process unit's specific config.
 type SyncerConfig struct {
 	MetaFile    string `yaml:"meta-file" toml:"meta-file" json:"meta-file"` // meta filename, used only when load SubConfig directly
 	WorkerCount int    `yaml:"worker-count" toml:"worker-count" json:"worker-count"`
@@ -256,10 +258,10 @@ func defaultSyncerConfig() SyncerConfig {
 	}
 }
 
-// alias to avoid infinite recursion for UnmarshalYAML
+// alias to avoid infinite recursion for UnmarshalYAML.
 type rawSyncerConfig SyncerConfig
 
-// UnmarshalYAML implements Unmarshaler.UnmarshalYAML
+// UnmarshalYAML implements Unmarshaler.UnmarshalYAML.
 func (m *SyncerConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	raw := rawSyncerConfig(defaultSyncerConfig())
 	if err := unmarshal(&raw); err != nil {
@@ -269,7 +271,7 @@ func (m *SyncerConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// TaskConfig is the configuration for Task
+// TaskConfig is the configuration for Task.
 type TaskConfig struct {
 	*flag.FlagSet `yaml:"-" toml:"-" json:"-"`
 
@@ -283,10 +285,11 @@ type TaskConfig struct {
 	// don't save configuration into it
 	MetaSchema string `yaml:"meta-schema" toml:"meta-schema" json:"meta-schema"`
 
-	EnableHeartbeat         bool   `yaml:"enable-heartbeat" toml:"enable-heartbeat" json:"enable-heartbeat"`
-	HeartbeatUpdateInterval int    `yaml:"heartbeat-update-interval" toml:"heartbeat-update-interval" json:"heartbeat-update-interval"`
-	HeartbeatReportInterval int    `yaml:"heartbeat-report-interval" toml:"heartbeat-report-interval" json:"heartbeat-report-interval"`
-	Timezone                string `yaml:"timezone" toml:"timezone" json:"timezone"`
+	EnableHeartbeat         bool `yaml:"enable-heartbeat" toml:"enable-heartbeat" json:"enable-heartbeat"`
+	HeartbeatUpdateInterval int  `yaml:"heartbeat-update-interval" toml:"heartbeat-update-interval" json:"heartbeat-update-interval"`
+	HeartbeatReportInterval int  `yaml:"heartbeat-report-interval" toml:"heartbeat-report-interval" json:"heartbeat-report-interval"`
+	// deprecated
+	Timezone string `yaml:"timezone" toml:"timezone" json:"timezone"`
 
 	// handle schema/table name mode, and only for schema/table name
 	// if case insensitive, we would convert schema/table name to lower case
@@ -301,6 +304,7 @@ type TaskConfig struct {
 	Routes         map[string]*router.TableRule   `yaml:"routes" toml:"routes" json:"routes"`
 	Filters        map[string]*bf.BinlogEventRule `yaml:"filters" toml:"filters" json:"filters"`
 	ColumnMappings map[string]*column.Rule        `yaml:"column-mappings" toml:"column-mappings" json:"column-mappings"`
+	ExprFilter     map[string]*ExpressionFilter   `yaml:"expression-filter" toml:"expression-filter" json:"expression-filter"`
 
 	// black-white-list is deprecated, use block-allow-list instead
 	BWList map[string]*filter.Rules `yaml:"black-white-list" toml:"black-white-list" json:"black-white-list"`
@@ -318,7 +322,7 @@ type TaskConfig struct {
 	RemoveMeta bool `yaml:"remove-meta"`
 }
 
-// NewTaskConfig creates a TaskConfig
+// NewTaskConfig creates a TaskConfig.
 func NewTaskConfig() *TaskConfig {
 	cfg := &TaskConfig{
 		// explicitly set default value
@@ -331,6 +335,7 @@ func NewTaskConfig() *TaskConfig {
 		Routes:                  make(map[string]*router.TableRule),
 		Filters:                 make(map[string]*bf.BinlogEventRule),
 		ColumnMappings:          make(map[string]*column.Rule),
+		ExprFilter:              make(map[string]*ExpressionFilter),
 		BWList:                  make(map[string]*filter.Rules),
 		BAList:                  make(map[string]*filter.Rules),
 		Mydumpers:               make(map[string]*MydumperConfig),
@@ -342,7 +347,7 @@ func NewTaskConfig() *TaskConfig {
 	return cfg
 }
 
-// String returns the config's yaml string
+// String returns the config's yaml string.
 func (c *TaskConfig) String() string {
 	cfg, err := yaml.Marshal(c)
 	if err != nil {
@@ -351,7 +356,7 @@ func (c *TaskConfig) String() string {
 	return string(cfg)
 }
 
-// JSON returns the config's json string
+// JSON returns the config's json string.
 func (c *TaskConfig) JSON() string {
 	//nolint:staticcheck
 	cfg, err := json.Marshal(c)
@@ -361,7 +366,7 @@ func (c *TaskConfig) JSON() string {
 	return string(cfg)
 }
 
-// DecodeFile loads and decodes config from file
+// DecodeFile loads and decodes config from file.
 func (c *TaskConfig) DecodeFile(fpath string) error {
 	bs, err := ioutil.ReadFile(fpath)
 	if err != nil {
@@ -376,7 +381,7 @@ func (c *TaskConfig) DecodeFile(fpath string) error {
 	return c.adjust()
 }
 
-// Decode loads config from file data
+// Decode loads config from file data.
 func (c *TaskConfig) Decode(data string) error {
 	err := yaml.UnmarshalStrict([]byte(data), c)
 	if err != nil {
@@ -386,7 +391,20 @@ func (c *TaskConfig) Decode(data string) error {
 	return c.adjust()
 }
 
-// adjust adjusts configs
+// find unused items in config.
+var configRefPrefixes = []string{"RouteRules", "FilterRules", "ColumnMappingRules", "Mydumper", "Loader", "Syncer", "ExprFilter"}
+
+const (
+	routeRulesIdx = iota
+	filterRulesIdx
+	columnMappingIdx
+	mydumperIdx
+	loaderIdx
+	syncerIdx
+	exprFilterIdx
+)
+
+// adjust adjusts and verifies config.
 func (c *TaskConfig) adjust() error {
 	if len(c.Name) == 0 {
 		return terror.ErrConfigNeedUniqueTaskName.Generate()
@@ -419,18 +437,55 @@ func (c *TaskConfig) adjust() error {
 		return terror.ErrConfigMySQLInstsAtLeastOne.Generate()
 	}
 
-	iids := make(map[string]int) // source-id -> instance-index
+	for name, exprFilter := range c.ExprFilter {
+		if exprFilter.Schema == "" {
+			return terror.ErrConfigExprFilterEmptyName.Generate(name, "schema")
+		}
+		if exprFilter.Table == "" {
+			return terror.ErrConfigExprFilterEmptyName.Generate(name, "table")
+		}
+		setFields := make([]string, 0, 1)
+		if exprFilter.InsertValueExpr != "" {
+			if err := checkValidExpr(exprFilter.InsertValueExpr); err != nil {
+				return terror.ErrConfigExprFilterWrongGrammar.Generate(name, exprFilter.InsertValueExpr, err)
+			}
+			setFields = append(setFields, "insert: ["+exprFilter.InsertValueExpr+"]")
+		}
+		if exprFilter.UpdateOldValueExpr != "" || exprFilter.UpdateNewValueExpr != "" {
+			if exprFilter.UpdateOldValueExpr != "" {
+				if err := checkValidExpr(exprFilter.UpdateOldValueExpr); err != nil {
+					return terror.ErrConfigExprFilterWrongGrammar.Generate(name, exprFilter.UpdateOldValueExpr, err)
+				}
+			}
+			if exprFilter.UpdateNewValueExpr != "" {
+				if err := checkValidExpr(exprFilter.UpdateNewValueExpr); err != nil {
+					return terror.ErrConfigExprFilterWrongGrammar.Generate(name, exprFilter.UpdateNewValueExpr, err)
+				}
+			}
+			setFields = append(setFields, "update (old value): ["+exprFilter.UpdateOldValueExpr+"] update (new value): ["+exprFilter.UpdateNewValueExpr+"]")
+		}
+		if exprFilter.DeleteValueExpr != "" {
+			if err := checkValidExpr(exprFilter.DeleteValueExpr); err != nil {
+				return terror.ErrConfigExprFilterWrongGrammar.Generate(name, exprFilter.DeleteValueExpr, err)
+			}
+			setFields = append(setFields, "delete: ["+exprFilter.DeleteValueExpr+"]")
+		}
+		if len(setFields) > 1 {
+			return terror.ErrConfigExprFilterManyExpr.Generate(name, setFields)
+		}
+	}
+
+	instanceIDs := make(map[string]int) // source-id -> instance-index
 	globalConfigReferCount := map[string]int{}
-	prefixs := []string{"RouteRules", "FilterRules", "ColumnMappingRules", "Mydumper", "Loader", "Syncer"}
 	duplicateErrorStrings := make([]string, 0)
 	for i, inst := range c.MySQLInstances {
 		if err := inst.VerifyAndAdjust(); err != nil {
 			return terror.Annotatef(err, "mysql-instance: %s", humanize.Ordinal(i))
 		}
-		if iid, ok := iids[inst.SourceID]; ok {
+		if iid, ok := instanceIDs[inst.SourceID]; ok {
 			return terror.ErrConfigMySQLInstSameSourceID.Generate(iid, i, inst.SourceID)
 		}
-		iids[inst.SourceID] = i
+		instanceIDs[inst.SourceID] = i
 
 		switch c.TaskMode {
 		case ModeFull, ModeAll:
@@ -451,19 +506,19 @@ func (c *TaskConfig) adjust() error {
 			if _, ok := c.Routes[name]; !ok {
 				return terror.ErrConfigRouteRuleNotFound.Generate(i, name)
 			}
-			globalConfigReferCount[prefixs[0]+name]++
+			globalConfigReferCount[configRefPrefixes[routeRulesIdx]+name]++
 		}
 		for _, name := range inst.FilterRules {
 			if _, ok := c.Filters[name]; !ok {
 				return terror.ErrConfigFilterRuleNotFound.Generate(i, name)
 			}
-			globalConfigReferCount[prefixs[1]+name]++
+			globalConfigReferCount[configRefPrefixes[filterRulesIdx]+name]++
 		}
 		for _, name := range inst.ColumnMappingRules {
 			if _, ok := c.ColumnMappings[name]; !ok {
 				return terror.ErrConfigColumnMappingNotFound.Generate(i, name)
 			}
-			globalConfigReferCount[prefixs[2]+name]++
+			globalConfigReferCount[configRefPrefixes[columnMappingIdx]+name]++
 		}
 
 		// only when BAList is empty use BWList
@@ -479,7 +534,7 @@ func (c *TaskConfig) adjust() error {
 			if !ok {
 				return terror.ErrConfigMydumperCfgNotFound.Generate(i, inst.MydumperConfigName)
 			}
-			globalConfigReferCount[prefixs[3]+inst.MydumperConfigName]++
+			globalConfigReferCount[configRefPrefixes[mydumperIdx]+inst.MydumperConfigName]++
 			inst.Mydumper = new(MydumperConfig)
 			*inst.Mydumper = *rule // ref mydumper config
 		}
@@ -507,7 +562,7 @@ func (c *TaskConfig) adjust() error {
 			if !ok {
 				return terror.ErrConfigLoaderCfgNotFound.Generate(i, inst.LoaderConfigName)
 			}
-			globalConfigReferCount[prefixs[4]+inst.LoaderConfigName]++
+			globalConfigReferCount[configRefPrefixes[loaderIdx]+inst.LoaderConfigName]++
 			inst.Loader = new(LoaderConfig)
 			*inst.Loader = *rule // ref loader config
 		}
@@ -527,7 +582,7 @@ func (c *TaskConfig) adjust() error {
 			if !ok {
 				return terror.ErrConfigSyncerCfgNotFound.Generate(i, inst.SyncerConfigName)
 			}
-			globalConfigReferCount[prefixs[5]+inst.SyncerConfigName]++
+			globalConfigReferCount[configRefPrefixes[syncerIdx]+inst.SyncerConfigName]++
 			inst.Syncer = new(SyncerConfig)
 			*inst.Syncer = *rule // ref syncer config
 		}
@@ -547,46 +602,64 @@ func (c *TaskConfig) adjust() error {
 			log.L().Warn("DM could discover proper ANSI_QUOTES, `enable-ansi-quotes` is no longer take effect")
 		}
 
+		for _, name := range inst.ExpressionFilters {
+			if _, ok := c.ExprFilter[name]; !ok {
+				return terror.ErrConfigExprFilterNotFound.Generate(i, name)
+			}
+			globalConfigReferCount[configRefPrefixes[exprFilterIdx]+name]++
+		}
+
 		if dupeRules := checkDuplicateString(inst.RouteRules); len(dupeRules) > 0 {
 			duplicateErrorStrings = append(duplicateErrorStrings, fmt.Sprintf("mysql-instance(%d)'s route-rules: %s", i, strings.Join(dupeRules, ", ")))
 		}
 		if dupeRules := checkDuplicateString(inst.FilterRules); len(dupeRules) > 0 {
 			duplicateErrorStrings = append(duplicateErrorStrings, fmt.Sprintf("mysql-instance(%d)'s filter-rules: %s", i, strings.Join(dupeRules, ", ")))
 		}
+		if dupeRules := checkDuplicateString(inst.ColumnMappingRules); len(dupeRules) > 0 {
+			duplicateErrorStrings = append(duplicateErrorStrings, fmt.Sprintf("mysql-instance(%d)'s column-mapping-rules: %s", i, strings.Join(dupeRules, ", ")))
+		}
+		if dupeRules := checkDuplicateString(inst.ExpressionFilters); len(dupeRules) > 0 {
+			duplicateErrorStrings = append(duplicateErrorStrings, fmt.Sprintf("mysql-instance(%d)'s expression-filters: %s", i, strings.Join(dupeRules, ", ")))
+		}
 	}
 	if len(duplicateErrorStrings) > 0 {
 		return terror.ErrConfigDuplicateCfgItem.Generate(strings.Join(duplicateErrorStrings, "\n"))
 	}
 
-	unusedConfigs := []string{}
+	var unusedConfigs []string
 	for route := range c.Routes {
-		if globalConfigReferCount[prefixs[0]+route] == 0 {
+		if globalConfigReferCount[configRefPrefixes[routeRulesIdx]+route] == 0 {
 			unusedConfigs = append(unusedConfigs, route)
 		}
 	}
 	for filter := range c.Filters {
-		if globalConfigReferCount[prefixs[1]+filter] == 0 {
+		if globalConfigReferCount[configRefPrefixes[filterRulesIdx]+filter] == 0 {
 			unusedConfigs = append(unusedConfigs, filter)
 		}
 	}
 	for columnMapping := range c.ColumnMappings {
-		if globalConfigReferCount[prefixs[2]+columnMapping] == 0 {
+		if globalConfigReferCount[configRefPrefixes[columnMappingIdx]+columnMapping] == 0 {
 			unusedConfigs = append(unusedConfigs, columnMapping)
 		}
 	}
 	for mydumper := range c.Mydumpers {
-		if globalConfigReferCount[prefixs[3]+mydumper] == 0 {
+		if globalConfigReferCount[configRefPrefixes[mydumperIdx]+mydumper] == 0 {
 			unusedConfigs = append(unusedConfigs, mydumper)
 		}
 	}
 	for loader := range c.Loaders {
-		if globalConfigReferCount[prefixs[4]+loader] == 0 {
+		if globalConfigReferCount[configRefPrefixes[loaderIdx]+loader] == 0 {
 			unusedConfigs = append(unusedConfigs, loader)
 		}
 	}
 	for syncer := range c.Syncers {
-		if globalConfigReferCount[prefixs[5]+syncer] == 0 {
+		if globalConfigReferCount[configRefPrefixes[syncerIdx]+syncer] == 0 {
 			unusedConfigs = append(unusedConfigs, syncer)
+		}
+	}
+	for exprFilter := range c.ExprFilter {
+		if globalConfigReferCount[configRefPrefixes[exprFilterIdx]+exprFilter] == 0 {
+			unusedConfigs = append(unusedConfigs, exprFilter)
 		}
 	}
 
@@ -594,14 +667,10 @@ func (c *TaskConfig) adjust() error {
 		sort.Strings(unusedConfigs)
 		return terror.ErrConfigGlobalConfigsUnused.Generate(unusedConfigs)
 	}
-
 	if c.Timezone != "" {
-		_, err := time.LoadLocation(c.Timezone)
-		if err != nil {
-			return terror.ErrConfigInvalidTimezone.Delegate(err, c.Timezone)
-		}
+		log.L().Warn("`timezone` is deprecated and useless anymore, please remove it.")
+		c.Timezone = ""
 	}
-
 	if c.RemoveMeta {
 		log.L().Warn("`remove-meta` in task config is deprecated, please use `start-task ... --remove-meta` instead")
 	}
@@ -609,7 +678,7 @@ func (c *TaskConfig) adjust() error {
 	return nil
 }
 
-// SubTaskConfigs generates sub task configs
+// SubTaskConfigs generates sub task configs.
 func (c *TaskConfig) SubTaskConfigs(sources map[string]DBConfig) ([]*SubTaskConfig, error) {
 	cfgs := make([]*SubTaskConfig, len(c.MySQLInstances))
 	for i, inst := range c.MySQLInstances {
@@ -633,7 +702,6 @@ func (c *TaskConfig) SubTaskConfigs(sources map[string]DBConfig) ([]*SubTaskConf
 		}
 		cfg.HeartbeatUpdateInterval = c.HeartbeatUpdateInterval
 		cfg.HeartbeatReportInterval = c.HeartbeatReportInterval
-		cfg.Timezone = c.Timezone
 		cfg.Meta = inst.Meta
 
 		cfg.From = dbCfg
@@ -661,6 +729,11 @@ func (c *TaskConfig) SubTaskConfigs(sources map[string]DBConfig) ([]*SubTaskConf
 			cfg.ColumnMappingRules[j] = c.ColumnMappings[name]
 		}
 
+		cfg.ExprFilter = make([]*ExpressionFilter, len(inst.ExpressionFilters))
+		for j, name := range inst.ExpressionFilters {
+			cfg.ExprFilter[j] = c.ExprFilter[name]
+		}
+
 		cfg.BAList = c.BAList[inst.BAListName]
 
 		cfg.MydumperConfig = *inst.Mydumper
@@ -681,7 +754,7 @@ func (c *TaskConfig) SubTaskConfigs(sources map[string]DBConfig) ([]*SubTaskConf
 
 // getGenerateName generates name by rule or gets name from nameMap
 // if it's a new name, increase nameIdx
-// otherwise return current nameIdx
+// otherwise return current nameIdx.
 func getGenerateName(rule interface{}, nameIdx int, namePrefix string, nameMap map[string]string) (string, int) {
 	// use json as key since no DeepEqual for rules now.
 	ruleByte, err := json.Marshal(rule)
@@ -711,7 +784,6 @@ func FromSubTaskConfigs(stCfgs ...*SubTaskConfig) *TaskConfig {
 	c.EnableHeartbeat = stCfg0.EnableHeartbeat
 	c.HeartbeatUpdateInterval = stCfg0.HeartbeatUpdateInterval
 	c.HeartbeatReportInterval = stCfg0.HeartbeatReportInterval
-	c.Timezone = stCfg0.Timezone
 	c.CaseSensitive = stCfg0.CaseSensitive
 	c.TargetDB = &stCfg0.To // just ref
 	c.OnlineDDLScheme = stCfg0.OnlineDDLScheme
@@ -724,21 +796,23 @@ func FromSubTaskConfigs(stCfgs ...*SubTaskConfig) *TaskConfig {
 	c.Mydumpers = make(map[string]*MydumperConfig)
 	c.Loaders = make(map[string]*LoaderConfig)
 	c.Syncers = make(map[string]*SyncerConfig)
+	c.ExprFilter = make(map[string]*ExpressionFilter)
 
-	BAListMap := make(map[string]string, len(stCfgs))
+	baListMap := make(map[string]string, len(stCfgs))
 	routeMap := make(map[string]string, len(stCfgs))
 	filterMap := make(map[string]string, len(stCfgs))
 	dumpMap := make(map[string]string, len(stCfgs))
 	loadMap := make(map[string]string, len(stCfgs))
 	syncMap := make(map[string]string, len(stCfgs))
 	cmMap := make(map[string]string, len(stCfgs))
-	var baListIdx, routeIdx, filterIdx, dumpIdx, loadIdx, syncIdx, cmIdx int
-	var baListName, routeName, filterName, dumpName, loadName, syncName, cmName string
+	exprFilterMap := make(map[string]string, len(stCfgs))
+	var baListIdx, routeIdx, filterIdx, dumpIdx, loadIdx, syncIdx, cmIdx, efIdx int
+	var baListName, routeName, filterName, dumpName, loadName, syncName, cmName, efName string
 
 	// NOTE:
 	// - we choose to ref global configs for instances now.
 	for _, stCfg := range stCfgs {
-		baListName, baListIdx = getGenerateName(stCfg.BAList, baListIdx, "balist", BAListMap)
+		baListName, baListIdx = getGenerateName(stCfg.BAList, baListIdx, "balist", baListMap)
 		c.BAList[baListName] = stCfg.BAList
 
 		routeNames := make([]string, 0, len(stCfg.RouteRules))
@@ -764,6 +838,13 @@ func FromSubTaskConfigs(stCfgs ...*SubTaskConfig) *TaskConfig {
 		syncName, syncIdx = getGenerateName(stCfg.SyncerConfig, syncIdx, "sync", syncMap)
 		c.Syncers[syncName] = &stCfg.SyncerConfig
 
+		exprFilterNames := make([]string, 0, len(stCfg.ExprFilter))
+		for _, f := range stCfg.ExprFilter {
+			efName, efIdx = getGenerateName(f, efIdx, "expr-filter", exprFilterMap)
+			exprFilterNames = append(exprFilterNames, efName)
+			c.ExprFilter[efName] = f
+		}
+
 		cmNames := make([]string, 0, len(stCfg.ColumnMappingRules))
 		for _, rule := range stCfg.ColumnMappingRules {
 			cmName, cmIdx = getGenerateName(rule, cmIdx, "cm", cmMap)
@@ -781,13 +862,14 @@ func FromSubTaskConfigs(stCfgs ...*SubTaskConfig) *TaskConfig {
 			MydumperConfigName: dumpName,
 			LoaderConfigName:   loadName,
 			SyncerConfigName:   syncName,
+			ExpressionFilters:  exprFilterNames,
 		})
 	}
 	return c
 }
 
 // checkDuplicateString checks whether the given string array has duplicate string item
-// if there is duplicate, it will return **all** the duplicate strings
+// if there is duplicate, it will return **all** the duplicate strings.
 func checkDuplicateString(ruleNames []string) []string {
 	mp := make(map[string]bool, len(ruleNames))
 	dupeArray := make([]string, 0)
@@ -804,7 +886,7 @@ func checkDuplicateString(ruleNames []string) []string {
 	return dupeArray
 }
 
-// AdjustTargetDBSessionCfg adjust session cfg of TiDB
+// AdjustTargetDBSessionCfg adjust session cfg of TiDB.
 func AdjustTargetDBSessionCfg(dbConfig *DBConfig, version *semver.Version) {
 	lowerMap := make(map[string]string, len(dbConfig.Session))
 	for k, v := range dbConfig.Session {
@@ -816,5 +898,35 @@ func AdjustTargetDBSessionCfg(dbConfig *DBConfig, version *semver.Version) {
 			lowerMap[cfg.key] = cfg.val
 		}
 	}
+	// force set time zone to UTC
+	if tz, ok := lowerMap["time_zone"]; ok {
+		log.L().Warn("session variable 'time_zone' is overwritten with UTC timezone.",
+			zap.String("time_zone", tz))
+	}
+	lowerMap["time_zone"] = defaultTimeZone
 	dbConfig.Session = lowerMap
+}
+
+// AdjustTargetDBTimeZone force adjust session `time_zone` to UTC.
+func AdjustTargetDBTimeZone(config *DBConfig) {
+	for k := range config.Session {
+		if strings.ToLower(k) == "time_zone" {
+			log.L().Warn("session variable 'time_zone' is overwritten by default UTC timezone.",
+				zap.String("time_zone", config.Session[k]))
+			config.Session[k] = defaultTimeZone
+			return
+		}
+	}
+	if config.Session == nil {
+		config.Session = make(map[string]string, 1)
+	}
+	config.Session["time_zone"] = defaultTimeZone
+}
+
+var defaultParser = parser.New()
+
+func checkValidExpr(expr string) error {
+	expr = "select " + expr
+	_, _, err := defaultParser.Parse(expr, "", "")
+	return err
 }

@@ -17,8 +17,8 @@ import (
 	"bytes"
 	"time"
 
-	gmysql "github.com/siddontang/go-mysql/mysql"
-	"github.com/siddontang/go-mysql/replication"
+	gmysql "github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 
 	"github.com/pingcap/dm/pkg/gtid"
 	"github.com/pingcap/dm/pkg/terror"
@@ -116,6 +116,9 @@ func GenCommonGTIDEvent(flavor string, serverID uint32, latestPos uint32, gSet g
 			return nil, terror.ErrBinlogMariaDBServerIDMismatch.Generate(mariaGTID.ServerID, header.ServerID)
 		}
 		gtidEv, err = GenMariaDBGTIDEvent(header, latestPos, mariaGTID.SequenceNumber, mariaGTID.DomainID)
+		if err != nil {
+			return gtidEv, err
+		}
 		// in go-mysql, set ServerID in parseEvent. we try to set it directly
 		gtidEvBody := gtidEv.Event.(*replication.MariadbGTIDEvent)
 		gtidEvBody.GTID.ServerID = header.ServerID

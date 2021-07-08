@@ -20,12 +20,12 @@ import (
 	"time"
 
 	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/go-mysql-org/go-mysql/mysql"
+	"github.com/go-mysql-org/go-mysql/replication"
 	gouuid "github.com/google/uuid"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/tidb-tools/pkg/filter"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/siddontang/go-mysql/mysql"
-	"github.com/siddontang/go-mysql/replication"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/dm/config"
@@ -73,7 +73,7 @@ func (s *testDBSuite) SetUpSuite(c *C) {
 
 func (s *testDBSuite) resetBinlogSyncer(c *C) {
 	cfg := replication.BinlogSyncerConfig{
-		ServerID:       uint32(s.cfg.ServerID),
+		ServerID:       s.cfg.ServerID,
 		Flavor:         "mysql",
 		Host:           s.cfg.From.Host,
 		Port:           uint16(s.cfg.From.Port),
@@ -82,11 +82,7 @@ func (s *testDBSuite) resetBinlogSyncer(c *C) {
 		UseDecimal:     true,
 		VerifyChecksum: true,
 	}
-	if s.cfg.Timezone != "" {
-		timezone, err2 := time.LoadLocation(s.cfg.Timezone)
-		c.Assert(err2, IsNil)
-		cfg.TimestampStringLocation = timezone
-	}
+	cfg.TimestampStringLocation = time.UTC
 
 	if s.syncer != nil {
 		s.syncer.Close()
@@ -111,6 +107,12 @@ func (s *testDBSuite) TestGetServerID(c *C) {
 	id, err := utils.GetServerID(context.Background(), s.db)
 	c.Assert(err, IsNil)
 	c.Assert(id, Greater, uint32(0))
+}
+
+func (s *testDBSuite) TestGetServerUnixTS(c *C) {
+	id, err := utils.GetServerUnixTS(context.Background(), s.db)
+	c.Assert(err, IsNil)
+	c.Assert(id, Greater, int64(0))
 }
 
 func (s *testDBSuite) TestBinaryLogs(c *C) {
@@ -216,7 +218,7 @@ func (s *testDBSuite) TestTimezone(c *C) {
 			"America/Phoenix",
 		},
 	}
-	queryTs := "select unix_timestamp(a) from `tztest_1`.`t_1` where id = ?"
+	queryTS := "select unix_timestamp(a) from `tztest_1`.`t_1` where id = ?"
 
 	dropSQLs := []string{
 		"drop table tztest_1.t_1",
@@ -236,7 +238,6 @@ func (s *testDBSuite) TestTimezone(c *C) {
 	}
 
 	for _, testCase := range testCases {
-		s.cfg.Timezone = testCase.timezone
 		syncer := NewSyncer(s.cfg, nil)
 		c.Assert(syncer.genRouter(), IsNil)
 		s.resetBinlogSyncer(c)
@@ -260,9 +261,6 @@ func (s *testDBSuite) TestTimezone(c *C) {
 		err = txn.Commit()
 		c.Assert(err, IsNil)
 
-		location, err := time.LoadLocation(testCase.timezone)
-		c.Assert(err, IsNil)
-
 		idx := 0
 		for {
 			if idx >= len(testCase.sqls) {
@@ -280,12 +278,12 @@ func (s *testDBSuite) TestTimezone(c *C) {
 
 				rowid := ev.Rows[0][0].(int32)
 				var ts sql.NullInt64
-				err2 := s.db.QueryRow(queryTs, rowid).Scan(&ts)
+				err2 := s.db.QueryRow(queryTS, rowid).Scan(&ts)
 				c.Assert(err2, IsNil)
 				c.Assert(ts.Valid, IsTrue)
 
 				raw := ev.Rows[0][1].(string)
-				data, err := time.ParseInLocation("2006-01-02 15:04:05", raw, location)
+				data, err := time.ParseInLocation("2006-01-02 15:04:05", raw, time.UTC)
 				c.Assert(err, IsNil)
 				c.Assert(data.Unix(), DeepEquals, ts.Int64)
 				idx++

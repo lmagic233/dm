@@ -16,19 +16,18 @@ package dumpling
 import (
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 
-	"github.com/docker/go-units"
 	"github.com/pingcap/dumpling/v4/export"
 	filter "github.com/pingcap/tidb-tools/pkg/table-filter"
 	"github.com/spf13/pflag"
 
+	dutils "github.com/pingcap/dm/pkg/dumpling"
 	"github.com/pingcap/dm/pkg/log"
 )
 
 // ParseArgLikeBash parses list arguments like bash, which helps us to run
-// executable command via os/exec more likely running from bash
+// executable command via os/exec more likely running from bash.
 func ParseArgLikeBash(args []string) []string {
 	result := make([]string, 0, len(args))
 	for _, arg := range args {
@@ -38,7 +37,7 @@ func ParseArgLikeBash(args []string) []string {
 	return result
 }
 
-// trimOutQuotes trims a pair of single quotes or a pair of double quotes from arg
+// trimOutQuotes trims a pair of single quotes or a pair of double quotes from arg.
 func trimOutQuotes(arg string) string {
 	argLen := len(arg)
 	if argLen >= 2 {
@@ -96,7 +95,7 @@ func parseExtraArgs(logger *log.Logger, dumpCfg *export.Config, args []string) e
 	}
 
 	if fileSizeStr != "" {
-		dumpCfg.FileSize, err = parseFileSize(fileSizeStr)
+		dumpCfg.FileSize, err = dutils.ParseFileSize(fileSizeStr, export.UnspecifiedSize)
 		if err != nil {
 			return err
 		}
@@ -112,20 +111,6 @@ func parseExtraArgs(logger *log.Logger, dumpCfg *export.Config, args []string) e
 	}
 
 	return nil
-}
-
-func parseFileSize(fileSizeStr string) (uint64, error) {
-	var fileSize uint64
-	if len(fileSizeStr) == 0 {
-		fileSize = export.UnspecifiedSize
-	} else if fileSizeMB, err := strconv.ParseUint(fileSizeStr, 10, 64); err == nil {
-		fileSize = fileSizeMB * units.MiB
-	} else if size, err := units.RAMInBytes(fileSizeStr); err == nil {
-		fileSize = uint64(size)
-	} else {
-		return 0, err
-	}
-	return fileSize, nil
 }
 
 // parseTableFilter parses `--tables-list` and `--filter`.

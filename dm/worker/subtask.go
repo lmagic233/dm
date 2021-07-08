@@ -18,10 +18,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
 	"github.com/pingcap/failpoint"
-	"github.com/siddontang/go-mysql/mysql"
-	"github.com/siddontang/go/sync2"
+	"github.com/prometheus/client_golang/prometheus"
 	"go.etcd.io/etcd/clientv3"
+	"go.uber.org/atomic"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/dm/config"
@@ -39,16 +40,16 @@ import (
 )
 
 const (
-	// the timout to wait for relay catchup when switching from load unit to sync unit.
-	waitRelayCatchupTimeout = 5 * time.Minute
+	// the timeout to wait for relay catchup when switching from load unit to sync unit.
+	waitRelayCatchupTimeout = 30 * time.Second
 )
 
 // createRealUnits is subtask units initializer
-// it can be used for testing
+// it can be used for testing.
 var createUnits = createRealUnits
 
-// createRealUnits creates process units base on task mode
-func createRealUnits(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []unit.Unit {
+// createRealUnits creates process units base on task mode.
+func createRealUnits(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, workerName string) []unit.Unit {
 	failpoint.Inject("mockCreateUnitsDumpOnly", func(_ failpoint.Value) {
 		log.L().Info("create mock worker units with dump unit only", zap.String("failpoint", "mockCreateUnitsDumpOnly"))
 		failpoint.Return([]unit.Unit{dumpling.NewDumpling(cfg)})
@@ -58,12 +59,12 @@ func createRealUnits(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []u
 	switch cfg.Mode {
 	case config.ModeAll:
 		us = append(us, dumpling.NewDumpling(cfg))
-		us = append(us, loader.NewLoader(cfg))
+		us = append(us, loader.NewLoader(cfg, etcdClient, workerName))
 		us = append(us, syncer.NewSyncer(cfg, etcdClient))
 	case config.ModeFull:
 		// NOTE: maybe need another checker in the future?
 		us = append(us, dumpling.NewDumpling(cfg))
-		us = append(us, loader.NewLoader(cfg))
+		us = append(us, loader.NewLoader(cfg, etcdClient, workerName))
 	case config.ModeIncrement:
 		us = append(us, syncer.NewSyncer(cfg, etcdClient))
 	default:
@@ -72,16 +73,15 @@ func createRealUnits(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []u
 	return us
 }
 
-// SubTask represents a sub task of data migration
+// SubTask represents a sub task of data migration.
 type SubTask struct {
 	cfg *config.SubTaskConfig
 
-	initialized sync2.AtomicBool
+	initialized atomic.Bool
 
 	l log.Logger
 
 	sync.RWMutex
-	wg sync.WaitGroup
 	// ctx is used for the whole subtask. It will be created only when we new a subtask.
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -92,24 +92,27 @@ type SubTask struct {
 	units    []unit.Unit // units do job one by one
 	currUnit unit.Unit
 	prevUnit unit.Unit
+	wg       sync.WaitGroup
 
 	stage  pb.Stage          // stage of current sub task
 	result *pb.ProcessResult // the process result, nil when is processing
 
 	etcdClient *clientv3.Client
+
+	workerName string
 }
 
 // NewSubTask is subtask initializer
-// it can be used for testing
+// it can be used for testing.
 var NewSubTask = NewRealSubTask
 
-// NewRealSubTask creates a new SubTask
-func NewRealSubTask(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) *SubTask {
-	return NewSubTaskWithStage(cfg, pb.Stage_New, etcdClient)
+// NewRealSubTask creates a new SubTask.
+func NewRealSubTask(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, workerName string) *SubTask {
+	return NewSubTaskWithStage(cfg, pb.Stage_New, etcdClient, workerName)
 }
 
-// NewSubTaskWithStage creates a new SubTask with stage
-func NewSubTaskWithStage(cfg *config.SubTaskConfig, stage pb.Stage, etcdClient *clientv3.Client) *SubTask {
+// NewSubTaskWithStage creates a new SubTask with stage.
+func NewSubTaskWithStage(cfg *config.SubTaskConfig, stage pb.Stage, etcdClient *clientv3.Client, workerName string) *SubTask {
 	ctx, cancel := context.WithCancel(context.Background())
 	st := SubTask{
 		cfg:        cfg,
@@ -118,14 +121,15 @@ func NewSubTaskWithStage(cfg *config.SubTaskConfig, stage pb.Stage, etcdClient *
 		ctx:        ctx,
 		cancel:     cancel,
 		etcdClient: etcdClient,
+		workerName: workerName,
 	}
-	taskState.WithLabelValues(st.cfg.Name, st.cfg.SourceID).Set(float64(st.stage))
+	updateTaskState(st.cfg.Name, st.cfg.SourceID, st.stage)
 	return &st
 }
 
-// Init initializes the sub task processing units
+// Init initializes the sub task processing units.
 func (st *SubTask) Init() error {
-	st.units = createUnits(st.cfg, st.etcdClient)
+	st.units = createUnits(st.cfg, st.etcdClient, st.workerName)
 	if len(st.units) < 1 {
 		return terror.ErrWorkerNoAvailUnits.Generate(st.cfg.Name, st.cfg.Mode)
 	}
@@ -139,7 +143,7 @@ func (st *SubTask) Init() error {
 			u.Close()
 		}
 
-		st.initialized.Set(initializeUnitSuccess)
+		st.initialized.Store(initializeUnitSuccess)
 	}()
 
 	// every unit does base initialization in `Init`, and this must pass before start running the sub task
@@ -160,7 +164,7 @@ func (st *SubTask) Init() error {
 	}
 
 	// if the sub task ran before, some units may be skipped
-	var skipIdx = 0
+	skipIdx := 0
 	for i := len(st.units) - 1; i > 0; i-- {
 		u := st.units[i]
 		ctx, cancel := context.WithTimeout(context.Background(), unit.DefaultInitTimeout)
@@ -183,15 +187,14 @@ func (st *SubTask) Init() error {
 	return nil
 }
 
-// Run runs the sub task
+// Run runs the sub task.
 func (st *SubTask) Run(expectStage pb.Stage) {
 	if st.Stage() == pb.Stage_Finished || st.Stage() == pb.Stage_Running {
 		st.l.Warn("prepare to run a subtask with invalid stage", zap.Stringer("current stage", st.Stage()))
 		return
 	}
 
-	err := st.Init()
-	if err != nil {
+	if err := st.Init(); err != nil {
 		st.l.Error("fail to initial subtask", log.ShortError(err))
 		st.fail(err)
 		return
@@ -206,7 +209,7 @@ func (st *SubTask) Run(expectStage pb.Stage) {
 }
 
 func (st *SubTask) run() {
-	st.setStage(pb.Stage_Running)
+	st.setStageAndResult(pb.Stage_Running, nil) // clear previous result
 	ctx, cancel := context.WithCancel(st.ctx)
 	st.setCurrCtx(ctx, cancel)
 	err := st.unitTransWaitCondition(ctx)
@@ -215,10 +218,10 @@ func (st *SubTask) run() {
 		st.fail(err)
 		return
 	} else if ctx.Err() != nil {
+		st.l.Error("exit SubTask.run", log.ShortError(ctx.Err()))
 		return
 	}
 
-	st.setResult(nil) // clear previous result
 	cu := st.CurrUnit()
 	st.l.Info("start to run", zap.Stringer("unit", cu.Type()))
 	pr := make(chan pb.ProcessResult, 1)
@@ -245,7 +248,7 @@ func (st *SubTask) callCurrCancel() {
 }
 
 // fetchResult fetches units process result
-// when dm-unit report an error, we need to re-Process the sub task
+// when dm-unit report an error, we need to re-Process the sub task.
 func (st *SubTask) fetchResult(pr chan pb.ProcessResult) {
 	defer st.wg.Done()
 
@@ -264,11 +267,11 @@ func (st *SubTask) fetchResult(pr chan pb.ProcessResult) {
 		}
 		result.Errors = errs
 
-		st.setResult(&result) // save result
-		st.callCurrCancel()   // dm-unit finished, canceled or error occurred, always cancel processing
+		st.callCurrCancel() // dm-unit finished, canceled or error occurred, always cancel processing
 
 		if len(result.Errors) == 0 && st.Stage() == pb.Stage_Pausing {
-			return // paused by external request
+			st.setResult(&result) // save result
+			return                // paused by external request
 		}
 
 		var (
@@ -284,11 +287,9 @@ func (st *SubTask) fetchResult(pr chan pb.ProcessResult) {
 		} else {
 			stage = pb.Stage_Paused // error occurred, paused
 		}
-		st.setStage(stage)
+		st.setStageAndResult(stage, &result)
 
-		ctx, cancel := context.WithTimeout(st.ctx, utils.DefaultDBTimeout)
-		defer cancel()
-		st.l.Info("unit process returned", zap.Stringer("unit", cu.Type()), zap.Stringer("stage", stage), zap.String("status", st.StatusJSON(ctx)))
+		st.l.Info("unit process returned", zap.Stringer("unit", cu.Type()), zap.Stringer("stage", stage), zap.String("status", st.StatusJSON()))
 
 		switch stage {
 		case pb.Stage_Finished:
@@ -313,31 +314,30 @@ func (st *SubTask) fetchResult(pr chan pb.ProcessResult) {
 	}
 }
 
-// setCurrUnit set current dm unit to ut and returns previous unit
-func (st *SubTask) setCurrUnit(ut unit.Unit) unit.Unit {
+// setCurrUnit set current dm unit to ut.
+func (st *SubTask) setCurrUnit(ut unit.Unit) {
 	st.Lock()
 	defer st.Unlock()
 	pu := st.currUnit
 	st.currUnit = ut
 	st.prevUnit = pu
-	return pu
 }
 
-// CurrUnit returns current dm unit
+// CurrUnit returns current dm unit.
 func (st *SubTask) CurrUnit() unit.Unit {
 	st.RLock()
 	defer st.RUnlock()
 	return st.currUnit
 }
 
-// PrevUnit returns dm previous unit
+// PrevUnit returns dm previous unit.
 func (st *SubTask) PrevUnit() unit.Unit {
 	st.RLock()
 	defer st.RUnlock()
 	return st.prevUnit
 }
 
-// closeUnits closes all un-closed units (current unit and all the subsequent units)
+// closeUnits closes all un-closed units (current unit and all the subsequent units).
 func (st *SubTask) closeUnits() {
 	st.RLock()
 	defer st.RUnlock()
@@ -363,7 +363,7 @@ func (st *SubTask) closeUnits() {
 }
 
 // getNextUnit gets the next process unit from st.units
-// if no next unit, return nil
+// if no next unit, return nil.
 func (st *SubTask) getNextUnit() unit.Unit {
 	var (
 		nu  unit.Unit
@@ -386,35 +386,43 @@ func (st *SubTask) setStage(stage pb.Stage) {
 	st.Lock()
 	defer st.Unlock()
 	st.stage = stage
-	taskState.WithLabelValues(st.cfg.Name, st.cfg.SourceID).Set(float64(st.stage))
+	updateTaskState(st.cfg.Name, st.cfg.SourceID, st.stage)
 }
 
-// stageCAS sets stage to newStage if its current value is oldStage
+func (st *SubTask) setStageAndResult(stage pb.Stage, result *pb.ProcessResult) {
+	st.Lock()
+	defer st.Unlock()
+	st.stage = stage
+	updateTaskState(st.cfg.Name, st.cfg.SourceID, st.stage)
+	st.result = result
+}
+
+// stageCAS sets stage to newStage if its current value is oldStage.
 func (st *SubTask) stageCAS(oldStage, newStage pb.Stage) bool {
 	st.Lock()
 	defer st.Unlock()
 
 	if st.stage == oldStage {
 		st.stage = newStage
-		taskState.WithLabelValues(st.cfg.Name, st.cfg.SourceID).Set(float64(st.stage))
+		updateTaskState(st.cfg.Name, st.cfg.SourceID, st.stage)
 		return true
 	}
 	return false
 }
 
-// setStageIfNot sets stage to newStage if its current value is not oldStage, similar to CAS
+// setStageIfNot sets stage to newStage if its current value is not oldStage, similar to CAS.
 func (st *SubTask) setStageIfNot(oldStage, newStage pb.Stage) bool {
 	st.Lock()
 	defer st.Unlock()
 	if st.stage != oldStage {
 		st.stage = newStage
-		taskState.WithLabelValues(st.cfg.Name, st.cfg.SourceID).Set(float64(st.stage))
+		updateTaskState(st.cfg.Name, st.cfg.SourceID, st.stage)
 		return true
 	}
 	return false
 }
 
-// Stage returns the stage of the sub task
+// Stage returns the stage of the sub task.
 func (st *SubTask) Stage() pb.Stage {
 	st.RLock()
 	defer st.RUnlock()
@@ -427,14 +435,14 @@ func (st *SubTask) setResult(result *pb.ProcessResult) {
 	st.result = result
 }
 
-// Result returns the result of the sub task
+// Result returns the result of the sub task.
 func (st *SubTask) Result() *pb.ProcessResult {
 	st.RLock()
 	defer st.RUnlock()
 	return st.result
 }
 
-// Close stops the sub task
+// Close stops the sub task.
 func (st *SubTask) Close() {
 	st.l.Info("closing")
 	if st.Stage() == pb.Stage_Stopped {
@@ -444,12 +452,12 @@ func (st *SubTask) Close() {
 
 	st.cancel()
 	st.closeUnits() // close all un-closed units
-	st.removeLabelValuesWithTaskInMetrics(st.cfg.Name, st.cfg.SourceID)
 	st.wg.Wait()
 	st.setStageIfNot(pb.Stage_Finished, pb.Stage_Stopped)
+	updateTaskState(st.cfg.Name, st.cfg.SourceID, pb.Stage_Stopped)
 }
 
-// Pause pauses the running sub task
+// Pause pauses the running sub task.
 func (st *SubTask) Pause() error {
 	if !st.stageCAS(pb.Stage_Running, pb.Stage_Pausing) {
 		return terror.ErrWorkerNotRunningStage.Generate(st.Stage().String())
@@ -467,9 +475,9 @@ func (st *SubTask) Pause() error {
 }
 
 // Resume resumes the paused sub task
-// similar to Run
+// similar to Run.
 func (st *SubTask) Resume() error {
-	if !st.initialized.Get() {
+	if !st.initialized.Load() {
 		st.Run(pb.Stage_Running)
 		return nil
 	}
@@ -484,15 +492,15 @@ func (st *SubTask) Resume() error {
 	err := st.unitTransWaitCondition(ctx)
 	if err != nil {
 		st.l.Error("wait condition", log.ShortError(err))
-		st.setStage(pb.Stage_Paused)
+		st.fail(err)
 		return err
 	} else if ctx.Err() != nil {
 		// ctx.Err() != nil means this context is canceled in other go routine,
 		// that go routine will change the stage, so don't need to set stage to paused here.
+		// nolint:nilerr
 		return nil
 	}
 
-	st.setResult(nil) // clear previous result
 	cu := st.CurrUnit()
 	st.l.Info("resume with unit", zap.Stringer("unit", cu.Type()))
 
@@ -501,11 +509,11 @@ func (st *SubTask) Resume() error {
 	go st.fetchResult(pr)
 	go cu.Resume(ctx, pr)
 
-	st.setStage(pb.Stage_Running)
+	st.setStageAndResult(pb.Stage_Running, nil) // clear previous result
 	return nil
 }
 
-// Update update the sub task's config
+// Update update the sub task's config.
 func (st *SubTask) Update(cfg *config.SubTaskConfig) error {
 	if !st.stageCAS(pb.Stage_Paused, pb.Stage_Paused) { // only test for Paused
 		return terror.ErrWorkerUpdateTaskStage.Generate(st.Stage().String())
@@ -536,7 +544,7 @@ func (st *SubTask) OperateSchema(ctx context.Context, req *pb.OperateWorkerSchem
 	return syncUnit.OperateSchema(ctx, req)
 }
 
-// UpdateFromConfig updates config for `From`
+// UpdateFromConfig updates config for `From`.
 func (st *SubTask) UpdateFromConfig(cfg *config.SubTaskConfig) error {
 	st.Lock()
 	defer st.Unlock()
@@ -553,7 +561,7 @@ func (st *SubTask) UpdateFromConfig(cfg *config.SubTaskConfig) error {
 	return nil
 }
 
-// CheckUnit checks whether current unit is sync unit
+// CheckUnit checks whether current unit is sync unit.
 func (st *SubTask) CheckUnit() bool {
 	st.Lock()
 	defer st.Unlock()
@@ -598,16 +606,14 @@ func (st *SubTask) unitTransWaitCondition(subTaskCtx context.Context) error {
 		st.l.Info("wait condition between two units", zap.Stringer("previous unit", pu.Type()), zap.Stringer("unit", cu.Type()))
 		hub := GetConditionHub()
 
-		if hub.w.relayHolder == nil {
+		if !hub.w.relayEnabled.Load() {
 			return nil
 		}
 
 		ctxWait, cancelWait := context.WithTimeout(hub.w.ctx, waitRelayCatchupTimeout)
 		defer cancelWait()
 
-		ctxStatus, cancelStatus := context.WithTimeout(ctxWait, utils.DefaultDBTimeout)
-		loadStatus := pu.Status(ctxStatus).(*pb.LoadStatus)
-		cancelStatus()
+		loadStatus := pu.Status().(*pb.LoadStatus)
 
 		if st.cfg.EnableGTID {
 			gset1, err = gtid.ParserGTID(st.cfg.Flavor, loadStatus.MetaBinlogGTID)
@@ -622,7 +628,7 @@ func (st *SubTask) unitTransWaitCondition(subTaskCtx context.Context) error {
 		}
 
 		for {
-			ctxStatus, cancelStatus = context.WithTimeout(ctxWait, utils.DefaultDBTimeout)
+			ctxStatus, cancelStatus := context.WithTimeout(ctxWait, utils.DefaultDBTimeout)
 			relayStatus := hub.w.relayHolder.Status(ctxStatus)
 			cancelStatus()
 
@@ -667,15 +673,14 @@ func (st *SubTask) unitTransWaitCondition(subTaskCtx context.Context) error {
 }
 
 func (st *SubTask) fail(err error) {
-	st.setStage(pb.Stage_Paused)
-	st.setResult(&pb.ProcessResult{
+	st.setStageAndResult(pb.Stage_Paused, &pb.ProcessResult{
 		Errors: []*pb.ProcessError{
 			unit.NewProcessError(err),
 		},
 	})
 }
 
-// HandleError handle error for syncer unit
+// HandleError handle error for syncer unit.
 func (st *SubTask) HandleError(ctx context.Context, req *pb.HandleWorkerErrorRequest) error {
 	syncUnit, ok := st.currUnit.(*syncer.Syncer)
 	if !ok {
@@ -691,4 +696,12 @@ func (st *SubTask) HandleError(ctx context.Context, req *pb.HandleWorkerErrorReq
 		err = st.Resume()
 	}
 	return err
+}
+
+func updateTaskState(task, sourceID string, stage pb.Stage) {
+	if stage == pb.Stage_Stopped || stage == pb.Stage_Finished {
+		taskState.DeleteAllAboutLabels(prometheus.Labels{"task": task, "source_id": sourceID})
+	} else {
+		taskState.WithLabelValues(task, sourceID).Set(float64(stage))
+	}
 }

@@ -16,11 +16,11 @@ package syncer
 import (
 	"context"
 
+	"github.com/go-mysql-org/go-mysql/replication"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb-tools/pkg/filter"
-	"github.com/siddontang/go-mysql/replication"
 	"go.uber.org/zap"
 
 	"github.com/pingcap/dm/pkg/log"
@@ -90,6 +90,13 @@ func (s *Syncer) handleQueryEventOptimistic(
 		tisAfter []*model.TableInfo
 		err      error
 	)
+
+	err = s.execError.Load()
+	if err != nil {
+		ec.tctx.L().Error("error detected when executing SQL job", log.ShortError(err))
+		// nolint:nilerr
+		return nil
+	}
 
 	switch needTrackDDLs[0].stmt.(type) {
 	case *ast.CreateDatabaseStmt, *ast.DropDatabaseStmt, *ast.AlterDatabaseStmt:
@@ -177,7 +184,7 @@ func (s *Syncer) handleQueryEventOptimistic(
 	}
 
 	if op.ConflictStage == optimism.ConflictDetected {
-		return terror.ErrSyncerShardDDLConflict.Generate(needHandleDDLs)
+		return terror.ErrSyncerShardDDLConflict.Generate(needHandleDDLs, op.ConflictMsg)
 	}
 
 	// updated needHandleDDLs to DDLs received from DM-master.
@@ -199,15 +206,16 @@ func (s *Syncer) handleQueryEventOptimistic(
 		tableNames: needTrackDDLs[0].tableNames,
 		stmt:       needTrackDDLs[0].stmt,
 	}
-	job := newDDLJob(ddlInfo, needHandleDDLs, *ec.lastLocation, *ec.startLocation, *ec.currentLocation, nil, originSQL)
+	job := newDDLJob(ddlInfo, needHandleDDLs, *ec.lastLocation, *ec.startLocation, *ec.currentLocation, nil, originSQL, ec.header)
 	err = s.addJobFunc(job)
 	if err != nil {
 		return err
 	}
 
-	err = s.execError.Get()
+	err = s.execError.Load()
 	if err != nil {
 		s.tctx.L().Error("error detected when executing SQL job", log.ShortError(err))
+		// nolint:nilerr
 		return nil
 	}
 

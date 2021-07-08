@@ -16,8 +16,8 @@
 
 ## Documentation
 
-* [Detailed documentation](https://pingcap.com/docs/tidb-data-migration/stable/)
-* [简体中文文档](https://pingcap.com/docs-cn/tidb-data-migration/stable/)
+* [Detailed documentation](https://docs.pingcap.com/tidb-data-migration/stable/)
+* [简体中文文档](https://docs.pingcap.com/zh/tidb-data-migration/stable/)
 
 ## Building
 
@@ -37,13 +37,15 @@ make dm-worker  # build DM-worker
 make dm-master  # build DM-master
 
 make dmctl      # build dmctl
-``` 
+```
 
 When DM is built successfully, you can find binaries in the `bin` directory.
 
 ## Run tests
 
 Run all tests, including unit tests and integration tests:
+
+See [test/README.md](./test/README.md) for a more detailed guidance.
 
 ```bash
 make test
@@ -81,4 +83,8 @@ DM is under the Apache 2.0 license. See the [LICENSE](./LICENSE) file for detail
     - [English](https://pingcap.com/blog/)
     - [简体中文](https://pingcap.com/blog-cn/)
 
-- [TiDB Monthly](https://pingcap.com/weekly/)
+- TiDB case studies
+
+    - [English](https://pingcap.com/case-studies/)
+    - [简体中文](https://pingcap.com/cases-cn/)
+

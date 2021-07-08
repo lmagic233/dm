@@ -22,9 +22,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-mysql-org/go-mysql/mysql"
 	. "github.com/pingcap/check"
 	"github.com/pingcap/failpoint"
-	"github.com/siddontang/go-mysql/mysql"
 	"github.com/tikv/pd/pkg/tempurl"
 	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/embed"
@@ -99,7 +99,7 @@ func createMockETCD(dir string, host string) (*embed.Etcd, error) {
 
 func (t *testServer) TestServer(c *C) {
 	var (
-		masterAddr   = "127.0.0.1:8261"
+		masterAddr   = tempurl.Alloc()[len("http://"):]
 		workerAddr1  = "127.0.0.1:8262"
 		keepAliveTTL = int64(1)
 	)
@@ -109,15 +109,16 @@ func (t *testServer) TestServer(c *C) {
 	defer ETCD.Close()
 	cfg := NewConfig()
 	c.Assert(cfg.Parse([]string{"-config=./dm-worker.toml"}), IsNil)
+	cfg.Join = masterAddr
 	cfg.KeepAliveTTL = keepAliveTTL
 	cfg.RelayKeepAliveTTL = keepAliveTTL
 
 	NewRelayHolder = NewDummyRelayHolder
-	NewSubTask = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) *SubTask {
+	NewSubTask = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) *SubTask {
 		cfg.UseRelay = false
-		return NewRealSubTask(cfg, etcdClient)
+		return NewRealSubTask(cfg, etcdClient, worker)
 	}
-	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client) []unit.Unit {
+	createUnits = func(cfg *config.SubTaskConfig, etcdClient *clientv3.Client, worker string) []unit.Unit {
 		mockDumper := NewMockUnit(pb.UnitType_Dump)
 		mockLoader := NewMockUnit(pb.UnitType_Load)
 		mockSync := NewMockUnit(pb.UnitType_Sync)
@@ -137,7 +138,7 @@ func (t *testServer) TestServer(c *C) {
 	}()
 
 	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
-		return !s.closed.Get()
+		return !s.closed.Load()
 	}), IsTrue)
 	dir := c.MkDir()
 
@@ -167,8 +168,6 @@ func (t *testServer) TestServer(c *C) {
 	subtaskCfg.MydumperPath = mydumperPath
 
 	sourceCfg := loadSourceConfigWithoutPassword(c)
-	_, err = ha.PutSubTaskCfg(s.etcdClient, subtaskCfg)
-	c.Assert(err, IsNil)
 	_, err = ha.PutSubTaskCfgStage(s.etcdClient, []config.SubTaskConfig{subtaskCfg},
 		[]ha.Stage{ha.NewSubTaskStage(pb.Stage_Running, sourceCfg.SourceID, subtaskCfg.Name)})
 	c.Assert(err, IsNil)
@@ -220,7 +219,7 @@ func (t *testServer) TestServer(c *C) {
 	s.Close()
 
 	c.Assert(utils.WaitSomething(30, 10*time.Millisecond, func() bool {
-		return s.closed.Get()
+		return s.closed.Load()
 	}), IsTrue)
 
 	// test worker, just make sure testing sort
@@ -229,7 +228,7 @@ func (t *testServer) TestServer(c *C) {
 
 func (t *testServer) TestHandleSourceBoundAfterError(c *C) {
 	var (
-		masterAddr   = "127.0.0.1:8261"
+		masterAddr   = tempurl.Alloc()[len("http://"):]
 		keepAliveTTL = int64(1)
 	)
 	// start etcd server
@@ -239,6 +238,7 @@ func (t *testServer) TestHandleSourceBoundAfterError(c *C) {
 	defer ETCD.Close()
 	cfg := NewConfig()
 	c.Assert(cfg.Parse([]string{"-config=./dm-worker.toml"}), IsNil)
+	cfg.Join = masterAddr
 	cfg.KeepAliveTTL = keepAliveTTL
 
 	// new etcd client
@@ -276,7 +276,7 @@ func (t *testServer) TestHandleSourceBoundAfterError(c *C) {
 		c.Assert(err1, IsNil)
 	}()
 	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
-		return !s.closed.Get()
+		return !s.closed.Load()
 	}), IsTrue)
 
 	// check if the worker is online
@@ -335,23 +335,19 @@ func (t *testServer) TestHandleSourceBoundAfterError(c *C) {
 	_, err = ha.PutSourceCfg(etcdCli, sourceCfg)
 	c.Assert(err, IsNil)
 	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
-		s.Mutex.Lock()
-		defer s.Mutex.Unlock()
-		return s.worker != nil
+		return s.getWorker(true) != nil
 	}), IsTrue)
 
 	_, err = ha.DeleteSourceBound(etcdCli, s.cfg.Name)
 	c.Assert(err, IsNil)
 	c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
-		s.Mutex.Lock()
-		defer s.Mutex.Unlock()
-		return s.worker == nil
+		return s.getWorker(true) == nil
 	}), IsTrue)
 }
 
 func (t *testServer) TestWatchSourceBoundEtcdCompact(c *C) {
 	var (
-		masterAddr   = "127.0.0.1:8261"
+		masterAddr   = tempurl.Alloc()[len("http://"):]
 		keepAliveTTL = int64(1)
 		startRev     = int64(1)
 	)
@@ -361,6 +357,7 @@ func (t *testServer) TestWatchSourceBoundEtcdCompact(c *C) {
 	defer ETCD.Close()
 	cfg := NewConfig()
 	c.Assert(cfg.Parse([]string{"-config=./dm-worker.toml"}), IsNil)
+	cfg.Join = masterAddr
 	cfg.KeepAliveTTL = keepAliveTTL
 	cfg.RelayKeepAliveTTL = keepAliveTTL
 
@@ -372,7 +369,7 @@ func (t *testServer) TestWatchSourceBoundEtcdCompact(c *C) {
 		DialKeepAliveTimeout: keepaliveTimeout,
 	})
 	s.etcdClient = etcdCli
-	s.closed.Set(false)
+	s.closed.Store(false)
 	c.Assert(err, IsNil)
 	sourceCfg := loadSourceConfigWithoutPassword(c)
 	sourceCfg.EnableRelay = false
@@ -389,7 +386,9 @@ func (t *testServer) TestWatchSourceBoundEtcdCompact(c *C) {
 	rev, err := ha.DeleteSourceBound(etcdCli, cfg.Name)
 	c.Assert(err, IsNil)
 	// step 2: start source at this worker
-	c.Assert(s.startWorker(&sourceCfg), IsNil)
+	w, err := s.getOrStartWorker(sourceCfg, true)
+	c.Assert(err, IsNil)
+	c.Assert(w.EnableHandleSubtasks(), IsNil)
 	// step 3: trigger etcd compaction and check whether we can receive it through watcher
 	_, err = etcdCli.Compact(ctx, rev)
 	c.Assert(err, IsNil)
@@ -411,8 +410,9 @@ func (t *testServer) TestWatchSourceBoundEtcdCompact(c *C) {
 		c.Assert(s.observeSourceBound(ctx1, startRev), IsNil)
 	}()
 	// step 4.1: should stop the running worker, source bound has been deleted, should stop this worker
-	time.Sleep(time.Second)
-	c.Assert(s.getWorker(true), IsNil)
+	c.Assert(utils.WaitSomething(20, 100*time.Millisecond, func() bool {
+		return s.getWorker(true) == nil
+	}), IsTrue)
 	// step 4.2: put a new source bound, source should be started
 	_, err = ha.PutSourceBound(etcdCli, sourceBound)
 	c.Assert(err, IsNil)
@@ -420,10 +420,10 @@ func (t *testServer) TestWatchSourceBoundEtcdCompact(c *C) {
 		return s.getWorker(true) != nil
 	}), IsTrue)
 	cfg2 := s.getWorker(true).cfg
-	c.Assert(*cfg2, DeepEquals, sourceCfg)
+	c.Assert(cfg2, DeepEquals, sourceCfg)
 	cancel1()
 	wg.Wait()
-	c.Assert(s.stopWorker(sourceCfg.SourceID), IsNil)
+	c.Assert(s.stopWorker(sourceCfg.SourceID, true), IsNil)
 	// step 5: start observeSourceBound from compacted revision again, should start worker
 	ctx2, cancel2 := context.WithCancel(ctx)
 	wg.Add(1)
@@ -435,12 +435,13 @@ func (t *testServer) TestWatchSourceBoundEtcdCompact(c *C) {
 		return s.getWorker(true) != nil
 	}), IsTrue)
 	cfg2 = s.getWorker(true).cfg
-	c.Assert(*cfg2, DeepEquals, sourceCfg)
+	c.Assert(cfg2, DeepEquals, sourceCfg)
 	cancel2()
 	wg.Wait()
 }
 
 func (t *testServer) testHTTPInterface(c *C, uri string) {
+	// nolint:noctx
 	resp, err := http.Get("http://127.0.0.1:8262/" + uri)
 	c.Assert(err, IsNil)
 	defer resp.Body.Close()
@@ -472,33 +473,35 @@ func (t *testServer) testOperateWorker(c *C, s *Server, dir string, start bool) 
 		// put mysql config into relative etcd key adapter to trigger operation event
 		_, err := ha.PutSourceCfg(s.etcdClient, sourceCfg)
 		c.Assert(err, IsNil)
-		_, err = ha.PutRelayStageSourceBound(s.etcdClient, ha.NewRelayStage(pb.Stage_Running, sourceCfg.SourceID),
+		_, err = ha.PutRelayStageRelayConfigSourceBound(s.etcdClient, ha.NewRelayStage(pb.Stage_Running, sourceCfg.SourceID),
 			ha.NewSourceBound(sourceCfg.SourceID, s.cfg.Name))
 		c.Assert(err, IsNil)
 		// worker should be started and without error
 		c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
 			w := s.getWorker(true)
-			return w != nil && w.closed.Get() == closedFalse
+			return w != nil && !w.closed.Load()
 		}), IsTrue)
 		c.Assert(s.getSourceStatus(true).Result, IsNil)
 	} else {
 		// worker should be started before stopped
 		w := s.getWorker(true)
 		c.Assert(w, NotNil)
-		c.Assert(w.closed.Get() == closedFalse, IsTrue)
-		_, err := ha.DeleteSourceCfgRelayStageSourceBound(s.etcdClient, sourceCfg.SourceID, s.cfg.Name)
+		c.Assert(w.closed.Load(), IsFalse)
+		_, err := ha.DeleteRelayConfig(s.etcdClient, w.name)
 		c.Assert(err, IsNil)
-		// worker should be started and without error
+		_, err = ha.DeleteSourceCfgRelayStageSourceBound(s.etcdClient, sourceCfg.SourceID, s.cfg.Name)
+		c.Assert(err, IsNil)
+		// worker should be closed and without error
 		c.Assert(utils.WaitSomething(30, 100*time.Millisecond, func() bool {
 			currentWorker := s.getWorker(true)
-			return currentWorker == nil && w.closed.Get() == closedTrue
+			return currentWorker == nil && w.closed.Load()
 		}), IsTrue)
 		c.Assert(s.getSourceStatus(true).Result, IsNil)
 	}
 }
 
-func (t *testServer) testRetryConnectMaster(c *C, s *Server, ETCD *embed.Etcd, dir string, hostName string) *embed.Etcd {
-	ETCD.Close()
+func (t *testServer) testRetryConnectMaster(c *C, s *Server, etcd *embed.Etcd, dir string, hostName string) *embed.Etcd {
+	etcd.Close()
 	time.Sleep(6 * time.Second)
 	// When worker server fail to keepalive with etcd, server should close its worker
 	c.Assert(s.getWorker(true), IsNil)
@@ -519,35 +522,50 @@ func (t *testServer) testSubTaskRecover(c *C, s *Server, dir string) {
 	c.Assert(status.Msg, Equals, terror.ErrWorkerNoStart.Error())
 
 	t.testOperateWorker(c, s, dir, true)
+
+	// because we split starting worker and enabling handling subtasks into two parts, a query-status may occur between
+	// them, thus get a result of no subtask running
+	utils.WaitSomething(30, 100*time.Millisecond, func() bool {
+		status, err = workerCli.QueryStatus(context.Background(), &pb.QueryStatusRequest{Name: "sub-task-name"})
+		if err != nil {
+			return false
+		}
+		if status.Result == false {
+			return false
+		}
+		if len(status.SubTaskStatus) == 0 || status.SubTaskStatus[0].Stage != pb.Stage_Running {
+			return false
+		}
+		return true
+	})
+
 	status, err = workerCli.QueryStatus(context.Background(), &pb.QueryStatusRequest{Name: "sub-task-name"})
 	c.Assert(err, IsNil)
 	c.Assert(status.Result, IsTrue)
+	c.Assert(status.SubTaskStatus, HasLen, 1)
 	c.Assert(status.SubTaskStatus[0].Stage, Equals, pb.Stage_Running)
 }
 
-func (t *testServer) testStopWorkerWhenLostConnect(c *C, s *Server, ETCD *embed.Etcd) {
-	ETCD.Close()
+func (t *testServer) testStopWorkerWhenLostConnect(c *C, s *Server, etcd *embed.Etcd) {
+	etcd.Close()
 	time.Sleep(retryConnectSleepTime + time.Duration(defaultKeepAliveTTL+3)*time.Second)
 	c.Assert(s.getWorker(true), IsNil)
 }
 
 func (t *testServer) TestGetMinLocInAllSubTasks(c *C) {
-	subTaskCfg := []*config.SubTaskConfig{
-		{
-			Name: "test2",
-		}, {
-			Name: "test3",
-		}, {
-			Name: "test1",
-		},
+	subTaskCfg := map[string]config.SubTaskConfig{
+		"test2": {Name: "test2"},
+		"test3": {Name: "test3"},
+		"test1": {Name: "test1"},
 	}
 	minLoc, err := getMinLocInAllSubTasks(context.Background(), subTaskCfg)
 	c.Assert(err, IsNil)
 	c.Assert(minLoc.Position.Name, Equals, "mysql-binlog.00001")
 	c.Assert(minLoc.Position.Pos, Equals, uint32(12))
 
-	for _, subtask := range subTaskCfg {
-		subtask.EnableGTID = true
+	for k, cfg := range subTaskCfg {
+		cfg.EnableGTID = true
+		subTaskCfg[k] = cfg
 	}
 
 	minLoc, err = getMinLocInAllSubTasks(context.Background(), subTaskCfg)
@@ -556,117 +574,7 @@ func (t *testServer) TestGetMinLocInAllSubTasks(c *C) {
 	c.Assert(minLoc.Position.Pos, Equals, uint32(123))
 }
 
-func (t *testServer) TestUnifyMasterBinlogPos(c *C) {
-	var (
-		pos1 = "(bin.000001, 3134)"
-		pos2 = "(bin.000001, 3234)"
-		pos3 = "(bin.000001, 3334)"
-		pos4 = "(bin.000001, 3434)"
-	)
-
-	// 1. should modify nothing
-	resp := &pb.QueryStatusResponse{
-		SubTaskStatus: []*pb.SubTaskStatus{{
-			Name:   "test",
-			Status: &pb.SubTaskStatus_Msg{Msg: "sub task not started"},
-		}},
-		SourceStatus: &pb.SourceStatus{},
-	}
-	resp2 := &pb.QueryStatusResponse{
-		SubTaskStatus: []*pb.SubTaskStatus{{
-			Name:   "test",
-			Status: &pb.SubTaskStatus_Msg{Msg: "sub task not started"},
-		}},
-		SourceStatus: &pb.SourceStatus{RelayStatus: &pb.RelayStatus{
-			Stage: pb.Stage_Stopped,
-		}},
-	}
-	resp3 := &pb.QueryStatusResponse{
-		SubTaskStatus: []*pb.SubTaskStatus{{
-			Name:   "test",
-			Status: &pb.SubTaskStatus_Msg{Msg: "sub task not started"},
-		}},
-		SourceStatus: &pb.SourceStatus{RelayStatus: &pb.RelayStatus{
-			MasterBinlog: pos1, RelayBinlog: pos1, RelayCatchUpMaster: true,
-		}},
-	}
-	resp4 := &pb.QueryStatusResponse{
-		SubTaskStatus: []*pb.SubTaskStatus{{
-			Unit: pb.UnitType_Load,
-		}, {
-			Unit:   pb.UnitType_Sync,
-			Status: &pb.SubTaskStatus_Sync{Sync: &pb.SyncStatus{MasterBinlog: pos2, SyncerBinlog: pos2, Synced: true}},
-		}},
-		SourceStatus: &pb.SourceStatus{},
-	}
-
-	for _, r := range []*pb.QueryStatusResponse{resp, resp2, resp3, resp4} {
-		// clone resp
-		bytes, _ := r.Marshal()
-		originReps := &pb.QueryStatusResponse{}
-		err := originReps.Unmarshal(bytes)
-		c.Assert(err, IsNil)
-
-		unifyMasterBinlogPos(r, false)
-		c.Assert(r, DeepEquals, originReps)
-	}
-
-	// 2. could work on multiple status
-	resp = &pb.QueryStatusResponse{
-		SubTaskStatus: []*pb.SubTaskStatus{{
-			Unit: pb.UnitType_Load,
-		}, {
-			Unit:   pb.UnitType_Sync,
-			Status: &pb.SubTaskStatus_Sync{Sync: &pb.SyncStatus{MasterBinlog: pos2, SyncerBinlog: pos2, Synced: true}},
-		}, {
-			Unit:   pb.UnitType_Sync,
-			Status: &pb.SubTaskStatus_Sync{Sync: &pb.SyncStatus{MasterBinlog: pos4, SyncerBinlog: pos3, Synced: false}},
-		}},
-		SourceStatus: &pb.SourceStatus{RelayStatus: &pb.RelayStatus{
-			MasterBinlog: pos1, RelayBinlog: pos1, RelayCatchUpMaster: true,
-		}},
-	}
-	unifyMasterBinlogPos(resp, false)
-
-	sync1 := resp.SubTaskStatus[1].Status.(*pb.SubTaskStatus_Sync).Sync
-	c.Assert(sync1.MasterBinlog, Equals, pos4)
-	c.Assert(sync1.Synced, IsFalse)
-	sync2 := resp.SubTaskStatus[2].Status.(*pb.SubTaskStatus_Sync).Sync
-	c.Assert(sync2.MasterBinlog, Equals, pos4)
-	c.Assert(sync2.Synced, IsFalse)
-	relay := resp.SourceStatus.RelayStatus
-	c.Assert(relay.MasterBinlog, Equals, pos4)
-	c.Assert(relay.RelayCatchUpMaster, IsFalse)
-
-	// 3. test unifyMasterBinlogPos(..., enableGTID = true)
-	resp = &pb.QueryStatusResponse{
-		SubTaskStatus: []*pb.SubTaskStatus{{
-			Unit: pb.UnitType_Load,
-		}, {
-			Unit:   pb.UnitType_Sync,
-			Status: &pb.SubTaskStatus_Sync{Sync: &pb.SyncStatus{MasterBinlog: pos2, SyncerBinlog: pos2, Synced: true}},
-		}, {
-			Unit:   pb.UnitType_Sync,
-			Status: &pb.SubTaskStatus_Sync{Sync: &pb.SyncStatus{MasterBinlog: pos4, SyncerBinlog: pos3, Synced: false}},
-		}},
-		SourceStatus: &pb.SourceStatus{RelayStatus: &pb.RelayStatus{
-			MasterBinlog: pos1, RelayBinlog: pos1, RelayCatchUpMaster: true,
-		}},
-	}
-	unifyMasterBinlogPos(resp, true)
-
-	sync1 = resp.SubTaskStatus[1].Status.(*pb.SubTaskStatus_Sync).Sync
-	c.Assert(sync1.MasterBinlog, Equals, pos4)
-	c.Assert(sync1.Synced, IsFalse)
-	sync2 = resp.SubTaskStatus[2].Status.(*pb.SubTaskStatus_Sync).Sync
-	c.Assert(sync2.MasterBinlog, Equals, pos4)
-	c.Assert(sync2.Synced, IsFalse)
-	relay = resp.SourceStatus.RelayStatus
-	c.Assert(relay.MasterBinlog, Equals, pos4)
-	c.Assert(relay.RelayCatchUpMaster, IsTrue)
-}
-
-func getFakeLocForSubTask(ctx context.Context, subTaskCfg *config.SubTaskConfig) (minLoc *binlog.Location, err error) {
+func getFakeLocForSubTask(ctx context.Context, subTaskCfg config.SubTaskConfig) (minLoc *binlog.Location, err error) {
 	gset1, _ := gtid.ParserGTID(mysql.MySQLFlavor, "ba8f633f-1f15-11eb-b1c7-0242ac110001:1-30")
 	gset2, _ := gtid.ParserGTID(mysql.MySQLFlavor, "ba8f633f-1f15-11eb-b1c7-0242ac110001:1-50")
 	gset3, _ := gtid.ParserGTID(mysql.MySQLFlavor, "ba8f633f-1f15-11eb-b1c7-0242ac110001:1-50,ba8f633f-1f15-11eb-b1c7-0242ac110002:1")
@@ -725,9 +633,8 @@ func checkRelayStatus(cli pb.WorkerClient, expect pb.Stage) bool {
 	return status.SourceStatus.RelayStatus.Stage == expect
 }
 
-func loadSourceConfigWithoutPassword(c *C) config.SourceConfig {
-	var sourceCfg config.SourceConfig
-	err := sourceCfg.LoadFromFile(sourceSampleFile)
+func loadSourceConfigWithoutPassword(c *C) *config.SourceConfig {
+	sourceCfg, err := config.LoadFromFile(sourceSampleFile)
 	c.Assert(err, IsNil)
 	sourceCfg.From.Password = "" // no password set
 	return sourceCfg

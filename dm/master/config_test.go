@@ -36,8 +36,7 @@ var (
 	_                 = check.Suite(&testConfigSuite{})
 )
 
-type testConfigSuite struct {
-}
+type testConfigSuite struct{}
 
 func (t *testConfigSuite) SetUpSuite(c *check.C) {
 	// initialized the logger to make genEmbedEtcdConfig working.
@@ -156,7 +155,7 @@ func (t *testConfigSuite) TestInvalidConfig(c *check.C) {
 master-addr = ":8261"
 advertise-addr = "127.0.0.1:8261"
 aaa = "xxx"`)
-	err = ioutil.WriteFile(filepath, configContent, 0644)
+	err = ioutil.WriteFile(filepath, configContent, 0o644)
 	c.Assert(err, check.IsNil)
 	err = cfg.configFromFile(filepath)
 	c.Assert(err, check.NotNil)
@@ -165,7 +164,7 @@ aaa = "xxx"`)
 	// invalid `master-addr`
 	filepath2 := path.Join(c.MkDir(), "test_invalid_config.toml")
 	configContent2 := []byte(`master-addr = ""`)
-	err = ioutil.WriteFile(filepath2, configContent2, 0644)
+	err = ioutil.WriteFile(filepath2, configContent2, 0o644)
 	c.Assert(err, check.IsNil)
 	err = cfg.configFromFile(filepath2)
 	c.Assert(err, check.IsNil)
@@ -191,6 +190,9 @@ func (t *testConfigSuite) TestGenEmbedEtcdConfig(c *check.C) {
 	c.Assert(etcdCfg.APUrls, check.DeepEquals, []url.URL{{Scheme: "http", Host: "127.0.0.1:8291"}})
 	c.Assert(etcdCfg.InitialCluster, check.DeepEquals, fmt.Sprintf("dm-master-%s=http://127.0.0.1:8291", hostname))
 	c.Assert(etcdCfg.ClusterState, check.Equals, embed.ClusterStateFlagExisting)
+	c.Assert(etcdCfg.AutoCompactionMode, check.Equals, "periodic")
+	c.Assert(etcdCfg.AutoCompactionRetention, check.Equals, "1h")
+	c.Assert(etcdCfg.QuotaBackendBytes, check.Equals, int64(2*1024*1024*1024))
 
 	cfg2 := *cfg1
 	cfg2.MasterAddr = "127.0.0.1\n:8261"

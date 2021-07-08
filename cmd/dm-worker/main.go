@@ -21,15 +21,15 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/pingcap/errors"
+	globalLog "github.com/pingcap/log"
+	"go.uber.org/zap"
+
 	"github.com/pingcap/dm/dm/ctl/common"
 	"github.com/pingcap/dm/dm/worker"
 	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dm/pkg/terror"
 	"github.com/pingcap/dm/pkg/utils"
-	globalLog "github.com/pingcap/log"
-
-	"github.com/pingcap/errors"
-	"go.uber.org/zap"
 )
 
 func main() {
@@ -40,7 +40,7 @@ func main() {
 	case flag.ErrHelp:
 		os.Exit(0)
 	default:
-		common.PrintLines("parse cmd flags err: %s", terror.Message(err))
+		common.PrintLinesf("parse cmd flags err: %s", terror.Message(err))
 		os.Exit(2)
 	}
 
@@ -50,7 +50,7 @@ func main() {
 		Level:  strings.ToLower(cfg.LogLevel),
 	})
 	if err != nil {
-		common.PrintLines("init logger error %s", terror.Message(err))
+		common.PrintLinesf("init logger error %s", terror.Message(err))
 		os.Exit(2)
 	}
 

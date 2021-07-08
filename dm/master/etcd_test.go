@@ -14,6 +14,7 @@
 package master
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -24,16 +25,17 @@ import (
 
 	"github.com/pingcap/check"
 	"github.com/tikv/pd/pkg/tempurl"
+	"go.etcd.io/etcd/clientv3"
 	"go.etcd.io/etcd/embed"
 
 	"github.com/pingcap/dm/pkg/log"
 	"github.com/pingcap/dm/pkg/terror"
+	"github.com/pingcap/dm/pkg/utils"
 )
 
 var _ = check.Suite(&testEtcdSuite{})
 
-type testEtcdSuite struct {
-}
+type testEtcdSuite struct{}
 
 func (t *testEtcdSuite) SetUpSuite(c *check.C) {
 	// initialized the logger to make genEmbedEtcdConfig working.
@@ -205,19 +207,54 @@ func (t *testEtcdSuite) cloneConfig(cfg *Config) *Config {
 	return clone
 }
 
-func (t *testEtcdSuite) TestIsDataExist(c *check.C) {
+func (t *testEtcdSuite) TestIsDirExist(c *check.C) {
 	d := "./directory-not-exists"
-	c.Assert(isDataExist(d), check.IsFalse)
+	c.Assert(isDirExist(d), check.IsFalse)
 
 	// empty directory
 	d = c.MkDir()
-	c.Assert(isDataExist(d), check.IsFalse)
+	c.Assert(isDirExist(d), check.IsTrue)
 
 	// data exists in the directory
 	for i := 1; i <= 3; i++ {
 		fp := filepath.Join(d, fmt.Sprintf("file.%d", i))
 		c.Assert(ioutil.WriteFile(fp, nil, privateDirMode), check.IsNil)
-		c.Assert(isDataExist(d), check.IsTrue)
-		c.Assert(isDataExist(fp), check.IsFalse) // not a directory
+		c.Assert(isDirExist(d), check.IsTrue)
+		c.Assert(isDirExist(fp), check.IsFalse) // not a directory
 	}
+}
+
+func (t *testEtcdSuite) TestEtcdAutoCompaction(c *check.C) {
+	cfg := NewConfig()
+	c.Assert(cfg.Parse([]string{"-config=./dm-master.toml"}), check.IsNil)
+
+	cfg.DataDir = c.MkDir()
+	cfg.MasterAddr = tempurl.Alloc()[len("http://"):]
+	cfg.AutoCompactionRetention = "1s"
+
+	ctx, cancel := context.WithCancel(context.Background())
+	s := NewServer(cfg)
+	c.Assert(s.Start(ctx), check.IsNil)
+
+	etcdCli, err := clientv3.New(clientv3.Config{
+		Endpoints: []string{cfg.MasterAddr},
+	})
+	c.Assert(err, check.IsNil)
+
+	for i := 0; i < 100; i++ {
+		_, err = etcdCli.Put(ctx, "key", fmt.Sprintf("%03d", i))
+		c.Assert(err, check.IsNil)
+	}
+	time.Sleep(3 * time.Second)
+	resp, err := etcdCli.Get(ctx, "key")
+	c.Assert(err, check.IsNil)
+
+	utils.WaitSomething(10, time.Second, func() bool {
+		_, err = etcdCli.Get(ctx, "key", clientv3.WithRev(resp.Header.Revision-1))
+		return err != nil
+	})
+	c.Assert(err, check.ErrorMatches, ".*required revision has been compacted.*")
+
+	cancel()
+	s.Close()
 }

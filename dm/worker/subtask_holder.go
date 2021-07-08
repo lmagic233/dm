@@ -14,6 +14,7 @@
 package worker
 
 import (
+	"context"
 	"sync"
 )
 
@@ -44,6 +45,20 @@ func (h *subTaskHolder) removeSubTask(name string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.subTasks, name)
+}
+
+// resetAllSubTasks does Close, change cfg.UseRelay then Init the subtasks.
+func (h *subTaskHolder) resetAllSubTasks(useRelay bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, st := range h.subTasks {
+		stage := st.Stage()
+		st.Close()
+		// TODO: make a st.reset
+		st.ctx, st.cancel = context.WithCancel(context.Background())
+		st.cfg.UseRelay = useRelay
+		st.Run(stage)
+	}
 }
 
 // closeAllSubTasks closes all subtask instances.

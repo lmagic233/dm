@@ -37,6 +37,7 @@ import (
 const (
 	opErrTypeBeforeOp    = "BeforeAnyOp"
 	opErrTypeSourceBound = "SourceBound"
+	opErrTypeRelaySource = "RelaySource"
 )
 
 var (
@@ -48,7 +49,7 @@ var (
 			Help:      "state of task, 0 - invalidStage, 1 - New, 2 - Running, 3 - Paused, 4 - Stopped, 5 - Finished",
 		}, []string{"task", "source_id"})
 
-	// opErrCounter cleans on worker close, which is the same time dm-worker exits, so no explicit clean
+	// opErrCounter cleans on worker close, which is the same time dm-worker exits, so no explicit clean.
 	opErrCounter = metricsproxy.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "dm",
@@ -66,8 +67,7 @@ var (
 		})
 )
 
-type statusHandler struct {
-}
+type statusHandler struct{}
 
 func (h *statusHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
@@ -100,7 +100,7 @@ func (s *Server) runBackgroundJob(ctx context.Context) {
 	}
 }
 
-// RegistryMetrics registries metrics for worker
+// RegistryMetrics registries metrics for worker.
 func RegistryMetrics() {
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
@@ -118,7 +118,7 @@ func RegistryMetrics() {
 	prometheus.DefaultGatherer = registry
 }
 
-// InitStatus initializes the HTTP status server
+// InitStatus initializes the HTTP status server.
 func InitStatus(lis net.Listener) {
 	mux := http.NewServeMux()
 	mux.Handle("/status", &statusHandler{})
@@ -137,8 +137,4 @@ func InitStatus(lis net.Listener) {
 	if err != nil && !common.IsErrNetClosing(err) && err != http.ErrServerClosed {
 		log.L().Error("status server returned", log.ShortError(err))
 	}
-}
-
-func (st *SubTask) removeLabelValuesWithTaskInMetrics(task string, source string) {
-	taskState.DeleteAllAboutLabels(prometheus.Labels{"task": task, "source_id": source})
 }

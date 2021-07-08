@@ -34,11 +34,11 @@ func (t *testForEtcd) TestOpsEtcd(c *C) {
 		bound         = NewSourceBound(source, worker)
 
 		emptyStage  Stage
-		sourceCfg   config.SourceConfig
 		subtaskCfg1 config.SubTaskConfig
 	)
 
-	c.Assert(sourceCfg.LoadFromFile(sourceSampleFile), IsNil)
+	sourceCfg, err := config.LoadFromFile(sourceSampleFile)
+	c.Assert(err, IsNil)
 	sourceCfg.SourceID = source
 	c.Assert(subtaskCfg1.DecodeFile(subTaskSampleFile, true), IsNil)
 	subtaskCfg1.SourceID = source
@@ -49,7 +49,7 @@ func (t *testForEtcd) TestOpsEtcd(c *C) {
 	c.Assert(subtaskCfg2.Adjust(true), IsNil)
 
 	// put relay stage and source bound.
-	rev1, err := PutRelayStageSourceBound(etcdTestCli, relayStage, bound)
+	rev1, err := PutRelayStageRelayConfigSourceBound(etcdTestCli, relayStage, bound)
 	c.Assert(err, IsNil)
 	c.Assert(rev1, Greater, int64(0))
 	// put source config.

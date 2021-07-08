@@ -32,8 +32,7 @@ var _ = Suite(&testUtilSuite{})
 type testUtilSuite struct{}
 
 func (t *testUtilSuite) TestSQLReplace(c *C) {
-
-	var replaceTests = []struct {
+	replaceTests := []struct {
 		in       string
 		old, new string
 		out      string
@@ -110,7 +109,7 @@ func (t *testUtilSuite) TestGetDBAndTableFromFilename(c *C) {
 		{"sqldb.tbl.0.sql", "sqldb", "tbl", ""},
 		{"db.tbl.sql0.sql", "db", "tbl", ""},
 		{"db.tbl.0", "", "", ".*doesn't have a `.sql` suffix.*"},
-		{"db.sql", "", "", ".*doesn't have correct `.` seperator.*"},
+		{"db.sql", "", "", ".*doesn't have correct `.` separator.*"},
 		{"db.0.sql", "db", "0", ""}, // treat `0` as the table name.
 	}
 
